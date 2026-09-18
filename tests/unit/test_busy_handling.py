@@ -269,3 +269,30 @@ class TestWhatsNewNotice:
         agent, link, ws = make_agent()
         await agent._on_whats_new({"summary": {"is_first_visit": True, "total": 5}})
         assert capsys.readouterr().out == "" and ws.sent == []
+
+
+class TestUnnamedBoard:
+    def test_board_without_a_name_is_not_ready_and_never_joins_default(self):
+        """The reported bug: 'board ''' + project 'default', then endless busy."""
+        import sys, types
+        from unittest import mock
+
+        class Board:
+            name = ""
+
+            def get_layer_name(self, i):
+                return ""
+
+        class FakeKiCad:
+            def __init__(self, client_name=None):
+                pass
+
+            def get_board(self):
+                return Board()
+
+            def get_open_documents(self, t):
+                return []
+
+        with mock.patch("kipy.KiCad", FakeKiCad):
+            with pytest.raises(KiCadBusy):
+                KiCadLink().connect()

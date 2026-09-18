@@ -99,7 +99,9 @@ async def run(args) -> int:
     schematic = None
     schematic_status = "disabled"
     if not args.no_schematic:
-        project_dir = os.path.abspath(args.project_dir or os.getcwd())
+        # Prefer what KiCad itself says the project folder is; the working
+        # directory is only a fallback (it is often the wrong folder).
+        project_dir = os.path.abspath(args.project_dir or link.project_dir or os.getcwd())
         try:
             sch_link = SchematicLink(project_dir)
             sheet_name = sch_link.connect()

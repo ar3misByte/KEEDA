@@ -7,6 +7,7 @@ fighting each other lives here.
 from __future__ import annotations
 
 import asyncio
+import time
 import logging
 import uuid as uuidlib
 
@@ -17,6 +18,15 @@ from agent.schematic_link import SchematicLink, SchematicUnavailable
 from agent.ws_client import WSClient
 
 log = logging.getLogger("kicadlive.agent")
+
+BUSY_HELP = "\n".join([
+    "KiCad has been 'busy' for over 30 s, so nothing can sync.",
+    "  1. In KiCad, close EVERY dialog (Plot, Board Setup, library warnings, 'Update PCB').",
+    "  2. Make sure the PCB EDITOR window is open with your board fully loaded",
+    "     (not only the project manager or the schematic editor).",
+    "  3. Still stuck: close all KiCad windows, reopen KiCad, open the PCB editor FIRST,",
+    "     then restart this agent.",
+])
 
 SELECTION_EVERY = 2          # poll selection every Nth board poll
 SCHEMATIC_EVERY = 4          # check schematic files every Nth poll (~1 s)
@@ -63,6 +73,9 @@ class SyncAgent:
         self._deferred: list[tuple[list[dict], str]] = []
         # File-level schematic sharing (set by main). None = disabled.
         self.schematic_sync = None
+        # One KiCad call at a time, and never on the event loop: a slow KiCad
+        # must not stall the WebSocket heartbeat (that looked like a disconnect).
+        self._kicad_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ utils
 
@@ -85,6 +98,10 @@ class SyncAgent:
         if lock is not None and lock.get("owner") != self.ws.client_id:
             return lock
         return None
+
+    async def _kc(self, fn, *args):
+        async with self._kicad_lock:
+            return await asyncio.to_thread(fn, *args)
 
     def banner(self, text: str) -> None:
         """User-facing notice. The agent console is part of the UI."""
@@ -122,6 +139,7 @@ class SyncAgent:
     async def poll_loop(self) -> None:
         delay = self.poll_interval
         busy_streak = 0
+        busy_since = last_help = time.monotonic()
         while True:
             await asyncio.sleep(delay)
             if not self.ws.connected.is_set():
@@ -132,10 +150,15 @@ class SyncAgent:
                 # Transient: a dialog is open, or the user is mid-drag. Back off
                 # gently and try again. Nothing is torn down and nobody is told
                 # this user went offline.
+                if busy_streak == 0:
+                    busy_since = time.monotonic()
                 busy_streak += 1
                 if busy_streak == 1:
                     log.warning("KiCad is busy (open dialog or an operation in "
                                 "progress) - waiting; nothing is lost")
+                if time.monotonic() - busy_since > 30 and                         time.monotonic() - last_help > 120:
+                    last_help = time.monotonic()
+                    self.banner(BUSY_HELP)
                 delay = min(self.poll_interval * (2 ** min(busy_streak, 4)), 3.0)
             except KiCadUnavailable as exc:
                 log.warning("KiCad unavailable: %s", exc)
@@ -156,8 +179,8 @@ class SyncAgent:
         an exception escaping the poll loop would kill the whole agent."""
         try:
             await self.send_presence("offline", kicad_connected=False)
-            self.link.connect()
-            self.baseline = self.link.read_snapshot()
+            await self._kc(self.link.connect)
+            self.baseline = await self._kc(self.link.read_snapshot)
         except KiCadUnavailable:
             await asyncio.sleep(2.0)
             return
@@ -175,7 +198,7 @@ class SyncAgent:
     async def poll_once(self) -> None:
         self._tick += 1
 
-        current = self.link.read_snapshot()
+        current = await self._kc(self.link.read_snapshot)
         changes = diff_snapshots(self.baseline, current)
 
         if changes:
@@ -325,7 +348,7 @@ class SyncAgent:
 
     async def poll_selection(self) -> None:
         try:
-            selection = self.link.selection_uuids()
+            selection = await self._kc(self.link.selection_uuids)
         except Exception:
             return
         if selection == self.selection:
@@ -402,7 +425,7 @@ class SyncAgent:
     async def _sync_state(self, message: dict) -> None:
         """Adopt the server's state wholesale. Also the reconnect path."""
         server_objects = message.get("objects") or {}
-        current = self.link.read_snapshot()     # KiCadBusy/Unavailable -> retried
+        current = await self._kc(self.link.read_snapshot)     # KiCadBusy/Unavailable -> retried
         # What the board REALLY holds. Without this, an empty baseline makes the
         # next poll report every footprint as a brand-new local "add".
         self.baseline = current
@@ -512,7 +535,7 @@ class SyncAgent:
             self._deferred.append((changes, description))
             return
         try:
-            self.link.apply_changes(changes, description)
+            await self._kc(self.link.apply_changes, changes, description)
         except KiCadBusy:
             self._deferred.append((changes, description))
             log.warning("KiCad busy - %d change(s) queued, will apply when it responds",
@@ -534,7 +557,7 @@ class SyncAgent:
         """Retry queued changes oldest-first. KiCadBusy leaves them queued."""
         while self._deferred:
             changes, description = self._deferred[0]
-            self.link.apply_changes(changes, description)
+            await self._kc(self.link.apply_changes, changes, description)
             self._deferred.pop(0)
             self._mark_applied(changes)
             log.info("applied %d queued remote change(s)", len(changes))

@@ -65,6 +65,7 @@ class KiCadLink:
         self.client_name = f"{client_name_prefix}-{uuidlib.uuid4().hex[:8]}"
         self._kicad = None
         self._board = None
+        self.project_dir: str | None = None
         self._layer_names: dict[int, str] = {}
         self._layer_ids: dict[str, int] = {}
 
@@ -78,6 +79,7 @@ class KiCadLink:
         """Attach to the running KiCad. Returns the open board's name."""
         try:
             from kipy import KiCad
+            from kipy.proto.common.types import DocumentType
         except ImportError as exc:
             raise KiCadUnavailable(
                 "the 'kicad-python' package is not installed (pip install -r requirements.txt)"
@@ -95,8 +97,20 @@ class KiCadLink:
                 f"and is 'Enable KiCad API' ticked in Preferences > Plugins?"
             ) from exc
 
-        self._cache_layers()
         name = self._board.name
+        try:
+            docs = self._kicad.get_open_documents(DocumentType.DOCTYPE_PCB)
+            self.project_dir = (docs[0].project.path if docs else "") or None
+        except Exception:
+            self.project_dir = None
+        if not name:
+            # KiCad answered but has no named board loaded yet (still loading, or
+            # this is not the PCB editor's socket). Joining as project 'default'
+            # would put this user in a different project from everyone else.
+            self._kicad = self._board = None
+            raise KiCadBusy("KiCad has no board loaded yet - open the PCB editor "
+                            "with your board and close any dialog")
+        self._cache_layers()
         log.info("connected to KiCad as %s, board '%s'", self.client_name, name)
         return name
 
