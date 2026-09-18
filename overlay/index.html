@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KiCad Live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◈</span>
+    <div>
+      <h1>KiCad Live</h1>
+      <p class="tagline">Real-time PCB collaboration</p>
+    </div>
+  </div>
+  <div class="conn" id="conn">
+    <span class="dot" id="conn-dot"></span>
+    <span id="conn-text">Connecting…</span>
+  </div>
+</header>
+
+<section class="stats">
+  <div class="stat"><div class="stat-value" id="stat-project">—</div><div class="stat-label">Project</div></div>
+  <div class="stat"><div class="stat-value" id="stat-clients">0</div><div class="stat-label">Designers online</div></div>
+  <div class="stat"><div class="stat-value" id="stat-locks">0</div><div class="stat-label">Active locks</div></div>
+  <div class="stat"><div class="stat-value" id="stat-version">0</div><div class="stat-label">Version</div></div>
+  <div class="stat"><div class="stat-value" id="stat-objects">0</div><div class="stat-label">Footprints</div></div>
+</section>
+
+<main class="grid">
+
+  <section class="panel">
+    <h2>Designers</h2>
+    <ul class="list" id="users">
+      <li class="empty">Nobody connected yet.</li>
+    </ul>
+  </section>
+
+  <section class="panel">
+    <h2>Component locks</h2>
+    <p class="hint">Locks are advisory — they are honoured by the KiCad Live agent, not enforced by KiCad itself.</p>
+    <ul class="list" id="locks">
+      <li class="empty">No components locked.</li>
+    </ul>
+  </section>
+
+  <section class="panel wide">
+    <h2>Activity</h2>
+    <ul class="feed" id="feed">
+      <li class="empty">Waiting for changes…</li>
+    </ul>
+  </section>
+
+</main>
+
+<footer class="foot">
+  LAN prototype — no authentication, no encryption. Do not run on an untrusted network.
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
