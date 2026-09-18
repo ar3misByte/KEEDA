@@ -1,9 +1,15 @@
 """KiCad Live Agent - runs on each designer's computer.
 
-Connects a running KiCad to the sync server. KiCad must already be open with a
-board, and 'Enable KiCad API' must be ticked in Preferences > Plugins.
-
     python -m agent.main --server 192.168.1.50 --name "Designer A"
+
+Two ways to collaborate, chosen automatically:
+
+  * LIVE mode   - KiCad's IPC API is usable: PCB edits sync per move.
+  * FILE-ONLY   - the API is busy / timing out / unavailable (or --file-only):
+                  schematic and PCB FILES are shared and merged, and the KiCad
+                  editors are reloaded for you (see agent/schematic_sync.py).
+
+Schematic sharing (files + merge + auto save/reload) runs in both modes.
 """
 from __future__ import annotations
 
@@ -17,6 +23,7 @@ import uuid as uuidlib
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from agent import win_ui
 from agent.kicad_link import KiCadBusy, KiCadLink, KiCadUnavailable
 from agent.schematic_link import SchematicLink, SchematicUnavailable
 from agent.schematic_sync import SchematicSync
@@ -60,88 +67,120 @@ def project_id_from_board(board_name: str) -> str:
     return cleaned[:64] or "default"
 
 
+def find_project_files(project_dir: str) -> tuple[str | None, str]:
+    """(project id, file name) taken from the KiCad files in a folder."""
+    try:
+        names = sorted(os.listdir(project_dir))
+    except OSError:
+        return None, f"cannot read {project_dir}"
+    for suffix in (".kicad_pcb", ".kicad_pro", ".kicad_sch"):
+        for name in names:
+            if name.endswith(suffix) and not name.startswith((".", "~", "_autosave")):
+                return project_id_from_board(name), name
+    return None, f"no KiCad files in {project_dir}"
+
+
+async def connect_live(link: KiCadLink) -> str:
+    """Attach to KiCad's API, waiting briefly while it is busy loading."""
+    for attempt in range(15):
+        try:
+            return link.connect()
+        except KiCadBusy:
+            if attempt == 0:
+                print(" KiCad is busy - waiting for it (close any open dialog)...")
+            await asyncio.sleep(2.0)
+    raise KiCadUnavailable("KiCad kept answering 'busy' or timing out for 30 s")
+
+
 async def run(args) -> int:
     print("=" * 62)
     print(f" KiCad Live Agent {AGENT_VERSION}")
     print("=" * 62)
 
     link = KiCadLink()
-    try:
-        # KiCad answers "busy" while it is still loading the board or while a
-        # dialog is open. That is not a failure: wait for it instead of quitting.
-        for attempt in range(30):
-            try:
-                board_name = link.connect()
-                break
-            except KiCadBusy:
-                if attempt == 0:
-                    print(" KiCad is busy - waiting for it (close any open dialog)...")
-                await asyncio.sleep(2.0)
-        else:
-            raise KiCadUnavailable("KiCad stayed busy for 60 s. Close any open dialog "
-                                   "in KiCad and start the agent again.")
-    except KiCadUnavailable as exc:
-        print("\n[FAIL] Could not connect to KiCad.")
-        print(f"       {exc}\n")
-        print("  Checklist:")
-        print("   1. Is KiCad open with a PCB (pcbnew) window?")
-        print("   2. Preferences > Plugins > 'Enable KiCad API' ticked?")
-        print("   3. Did you restart KiCad after ticking it?")
-        print("\n  See docs/TROUBLESHOOTING.md -> 'Agent cannot connect to KiCad'.")
-        return 2
+    file_only = args.file_only
+    board_name = ""
+    if not file_only:
+        try:
+            board_name = await connect_live(link)
+        except KiCadUnavailable as exc:
+            print(f"\n [!] KiCad's live API is not usable on this computer:\n     {exc}")
+            print("     Switching to FILE-ONLY mode: schematic and PCB files are shared and")
+            print("     merged and the KiCad editors reload by themselves. Layout and")
+            print("     schematic sync still work; they update when a file is saved.\n")
+            file_only = True
 
-    project_id = args.project or project_id_from_board(board_name)
+    if file_only:
+        project_dir = os.path.abspath(args.project_dir or os.getcwd())
+        found_id, note = find_project_files(project_dir)
+        if found_id is None:
+            print(f"\n[FAIL] {note}.\n       Start the agent inside your KiCad project folder, "
+                  'or pass --project-dir "C:\\path\\to\\project".')
+            return 2
+        project_id = args.project or found_id
+        board_name = note
+    else:
+        project_dir = os.path.abspath(args.project_dir or link.project_dir or os.getcwd())
+        project_id = args.project or project_id_from_board(board_name)
     client_id = args.client_id or stable_client_id()
 
-    # Schematic collaboration is file-based and read-only (eeschema has no IPC
-    # API in KiCad 10). It needs the project directory; default to the working
-    # directory, which is the project folder in the documented workflow.
     schematic = None
     schematic_status = "disabled"
     if not args.no_schematic:
-        # Prefer what KiCad itself says the project folder is; the working
-        # directory is only a fallback (it is often the wrong folder).
-        project_dir = os.path.abspath(args.project_dir or link.project_dir or os.getcwd())
         try:
             sch_link = SchematicLink(project_dir)
             sheet_name = sch_link.connect()
             schematic = sch_link
             stats = sch_link.stats()
             schematic_status = (f"{sheet_name} ({stats['objects']} objects, "
-                                f"{stats['sheets']} sheet(s)) - review only")
+                                f"{stats['sheets']} sheet(s))")
         except SchematicUnavailable as exc:
             schematic_status = f"not found ({exc})"
         except Exception as exc:
             schematic_status = f"unavailable ({exc})"
 
-    print(f" KiCad      {link.version()}")
+    mode = "FILE-ONLY (no KiCad API)" if file_only else "LIVE KiCad API + file sharing"
+    print(f" Mode       {mode}")
+    print(f" KiCad      {'n/a' if file_only else link.version()}")
     print(f" Board      {board_name}")
-    print(f" Project    {project_id}")
+    print(f" Project    {project_id}  (must be identical on every computer)")
+    print(f" Folder     {project_dir}")
     print(f" User       {args.name}")
     print(f" Client id  {client_id}")
     print(f" Schematic  {schematic_status}")
     print(f" Server     ws://{args.server}:{args.port}/ws")
     if args.read_only:
-        print(" Mode       READ-ONLY (receives changes, sends none)")
-    print("=" * 62)
-    print(" Press Ctrl+C to stop.\n")
+        print(" Read-only  receives changes, sends none")
 
     ws = WSClient(args.server, args.port, client_id, args.name, project_id)
-    agent = SyncAgent(link, ws, args.name, read_only=args.read_only,
-                      poll_interval=args.poll_interval, schematic=schematic)
+    if file_only:
+        from agent.file_only import FileOnlyAgent, NullLink
+        agent = FileOnlyAgent(NullLink(), ws, args.name, read_only=args.read_only,
+                              poll_interval=args.poll_interval, schematic=schematic)
+    else:
+        agent = SyncAgent(link, ws, args.name, read_only=args.read_only,
+                          poll_interval=args.poll_interval, schematic=schematic)
 
-    if schematic is not None and args.schematic_sync_interval > 0:
+    if args.schematic_sync_interval > 0:
         agent.schematic_sync = SchematicSync(
-            schematic.project_dir, ws, args.name, read_only=args.read_only,
+            project_dir, ws, args.name, read_only=args.read_only,
             interval=args.schematic_sync_interval, banner=agent.banner,
-            on_applied=lambda names: schematic.resync())
-        print(f" Sch. share every {int(args.schematic_sync_interval)} s "
-              "(saved sheets are shared; teammates' sheets are written to your folder)")
+            on_applied=lambda names: schematic.resync() if schematic is not None else None,
+            sync_pcb=file_only or args.sync_pcb_files,
+            auto_save=not args.no_auto_save, auto_reload=not args.no_auto_reload,
+            autosave_delay=args.autosave_delay)
+        shared = "schematic + PCB" if agent.schematic_sync.sync_pcb else "schematic"
+        auto = win_ui.AVAILABLE
+        print(f" File share {shared} files | auto-save "
+              f"{'on' if auto and not args.no_auto_save else 'off'} | auto-reload "
+              f"{'on' if auto and not args.no_auto_reload else 'off'}")
+    print("=" * 62)
+    print(" Press Ctrl+C to stop.\n")
 
     async def on_connect():
         # A fresh connection means our view may be stale; ask for the truth.
         agent.on_reconnect()
-        await agent.send_presence("viewing")
+        await agent.send_presence("viewing", kicad_connected=not file_only)
 
     ws.on_connect = on_connect
 
@@ -161,6 +200,8 @@ async def run(args) -> int:
               f"received={agent.stats['received']} "
               f"conflicts={agent.stats['conflicts']} "
               f"blocked-by-lock={agent.stats['blocked']}")
+        if agent.schematic_sync is not None:
+            print(f" File sharing: {agent.schematic_sync.stats}")
     return 0
 
 
@@ -170,18 +211,31 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--name", required=True, help="your display name, e.g. \"Designer A\"")
     parser.add_argument("--project", default=None,
-                        help="project id (default: derived from the open board's filename)")
+                        help="project id (default: derived from the board/project file name)")
     parser.add_argument("--client-id", default=None, help="override the stored client id")
     parser.add_argument("--read-only", action="store_true",
                         help="receive changes but never send any")
     parser.add_argument("--project-dir", default=None,
-                        help="project folder holding the .kicad_sch "
-                             "(default: the current directory)")
-    parser.add_argument("--schematic-sync-interval", type=float, default=120.0,
-                        help="seconds between schematic file refreshes from the team "
-                             "(default 120; 0 disables file sharing)")
+                        help="folder holding the .kicad_sch/.kicad_pcb "
+                             "(default: asked from KiCad, else the current directory)")
     parser.add_argument("--no-schematic", action="store_true",
                         help="do not watch the schematic at all")
+    parser.add_argument("--schematic-sync-interval", type=float, default=30.0,
+                        help="fallback seconds between file refreshes (default 30; new "
+                             "saves are shared immediately; 0 disables file sharing)")
+    parser.add_argument("--file-only", action="store_true",
+                        help="do not use KiCad's IPC API at all: share and merge the "
+                             "schematic and PCB files instead (chosen automatically when "
+                             "the API is busy or timing out)")
+    parser.add_argument("--sync-pcb-files", action="store_true",
+                        help="also share the .kicad_pcb file (implied by --file-only)")
+    parser.add_argument("--no-auto-save", action="store_true",
+                        help="do not save the editor for you; edits are shared only "
+                             "when you press Ctrl+S")
+    parser.add_argument("--no-auto-reload", action="store_true",
+                        help="do not reload the editor for you (do File > Revert yourself)")
+    parser.add_argument("--autosave-delay", type=float, default=3.0,
+                        help="seconds an edit stays unsaved before auto-save (default 3)")
     parser.add_argument("--poll-interval", type=float, default=POLL_INTERVAL,
                         help=f"board poll period in seconds (default {POLL_INTERVAL})")
     parser.add_argument("--verbose", action="store_true")

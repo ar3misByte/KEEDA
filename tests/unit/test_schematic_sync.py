@@ -83,6 +83,12 @@ class Peer:
         return True
 
 
+@pytest.fixture(autouse=True)
+def no_real_editors(monkeypatch):
+    """Never touch real KiCad windows from unit tests."""
+    monkeypatch.setattr("agent.schematic_sync.win_ui.AVAILABLE", False)
+
+
 @pytest.fixture
 def two(tmp_path):
     hub = Hub(tmp_path)
@@ -169,7 +175,7 @@ class TestSharing:
         assert bob.read() == V3, "bob's own work must not be overwritten"
         assert (bob.dir / ".kicad_live" / "incoming" / SHEET).read_bytes() == V2
         assert hub.store.get("p", SHEET)[0] == V2, "bob must not clobber alice on the server"
-        assert "BOTH changed" in bob.banners[-1]
+        assert "SAME object" in bob.banners[-1]
 
     @pytest.mark.asyncio
     async def test_merged_resave_after_conflict_is_shared(self, two):
@@ -224,3 +230,112 @@ class TestSharing:
         await bob.sync.cycle()
         restarted = SchematicSync(str(bob.dir), bob, "bob", interval=999)
         assert restarted.synced[SHEET] == sha256_of(V1)
+
+
+REAL = open(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "sample_project", "demo_board.kicad_sch"), encoding="utf-8").read()
+
+
+class TestMergeInsteadOfConflict:
+    @pytest.mark.asyncio
+    async def test_edits_to_different_parts_are_merged_and_shared(self, two):
+        alice, bob, hub = two
+        alice.write(REAL.encode())
+        await alice.sync.cycle()
+        await bob.sync.cycle()
+
+        alice.write(REAL.replace('"4k7"', '"10k"', 1).encode())   # alice edits one part
+        bob.write(REAL.replace('"100nF"', '"1uF"', 1).encode())   # bob edits another
+        await alice.sync.push_local()
+        await bob.sync.cycle()                                    # bob merges + shares
+
+        merged = bob.read().decode()
+        assert '"10k"' in merged and '"1uF"' in merged, "both edits must survive"
+        assert bob.sync.stats["merged"] == 1
+        assert not (bob.dir / ".kicad_live" / "incoming").exists()
+
+        await alice.sync.cycle()                                  # alice receives the merge
+        assert alice.read() == bob.read()
+        assert '"10k"' in alice.read().decode() and '"1uF"' in alice.read().decode()
+
+
+class TestEditorAutomation:
+    class FakeEditor:
+        def __init__(self, modified=False):
+            self.modified = modified
+            self.saved = self.reverted = 0
+
+        def is_modified(self):
+            return self.modified
+
+        def save(self):
+            self.saved += 1
+            self.modified = False
+            return True
+
+        def revert(self):
+            self.reverted += 1
+            return True
+
+        def blocked(self):
+            return False
+
+    @pytest.mark.asyncio
+    async def test_editor_is_reverted_after_a_teammates_file_arrives(self, two, monkeypatch):
+        alice, bob, hub = two
+        editor = self.FakeEditor()
+        monkeypatch.setattr("agent.schematic_sync.win_ui.AVAILABLE", True)
+        monkeypatch.setattr("agent.schematic_sync.win_ui.find_editor", lambda k, s="": editor)
+        alice.write(V1)
+        await alice.sync.cycle()
+        await bob.sync.cycle()
+        alice.write(V2)
+        await alice.sync.push_local()
+        await bob.sync.cycle()
+        assert editor.reverted >= 1 and bob.read() == V2
+        assert not any("Reload it" in b for b in bob.banners[-1:]), "no manual step needed"
+
+    @pytest.mark.asyncio
+    async def test_unsaved_edits_are_saved_first_never_reverted_over(self, two, monkeypatch):
+        alice, bob, hub = two
+        editor = self.FakeEditor(modified=False)
+        monkeypatch.setattr("agent.schematic_sync.win_ui.AVAILABLE", True)
+        monkeypatch.setattr("agent.schematic_sync.win_ui.find_editor", lambda k, s="": editor)
+        alice.write(V1)
+        await alice.sync.cycle()
+        await bob.sync.cycle()
+        editor.modified = True
+        alice.write(V2)
+        await alice.sync.push_local()
+        await bob.sync.cycle()
+        assert editor.saved == 1, "the user's unsaved edits are saved before anything else"
+
+    @pytest.mark.asyncio
+    async def test_without_auto_save_unsaved_edits_block_the_update(self, two, monkeypatch):
+        alice, bob, hub = two
+        editor = self.FakeEditor(modified=True)
+        monkeypatch.setattr("agent.schematic_sync.win_ui.AVAILABLE", True)
+        monkeypatch.setattr("agent.schematic_sync.win_ui.find_editor", lambda k, s="": editor)
+        bob.sync.auto_save = False
+        alice.write(V1)
+        await alice.sync.cycle()
+        bob.write(V1)
+        await bob.sync.cycle()
+        alice.write(V2)
+        await alice.sync.push_local()
+        await bob.sync.cycle()
+        assert bob.read() == V1 and editor.reverted == 0 and "unsaved" in bob.banners[-1]
+
+
+class TestPcbFiles:
+    @pytest.mark.asyncio
+    async def test_pcb_files_only_travel_when_enabled(self, two):
+        alice, bob, hub = two
+        pcb = b"(kicad_pcb (version 1) (footprint R1))\n"
+        alice.write(pcb, name="board.kicad_pcb")
+        await alice.sync.cycle()
+        assert hub.store.manifest("p") == {}, "off by default: the KiCad API syncs the PCB"
+        alice.sync.sync_pcb = bob.sync.sync_pcb = True
+        await alice.sync.cycle()
+        await bob.sync.cycle()
+        assert bob.read("board.kicad_pcb") == pcb

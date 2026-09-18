@@ -91,12 +91,23 @@ def main() -> int:
         check(False, "Connected to KiCad", exc)
         print("\n  KiCad must be OPEN with a PCB, and the API enabled + KiCad restarted.")
         print("  See docs/TROUBLESHOOTING.md -> 'Agent cannot connect to KiCad'.")
+        print("
+  If KiCad is open and this still says busy / timed out, KiCad's live API")
+        print("  will not work on this computer. That is OK: run the agent with --file-only")
+        print("  (it does this automatically) - see docs/LIVE_SCHEMATIC.md.")
         return 1
 
     check(True, "Connected to KiCad", link.version())
     check(True, "Board open", board_name)
 
-    snapshot = link.read_snapshot()
+    try:
+        snapshot = link.read_snapshot()
+    except KiCadUnavailable as exc:
+        check(False, "Footprints readable", exc)
+        print("
+  KiCad answers but will not serve the board (busy / timed out).")
+        print("  Use --file-only mode: python -m agent.main --server IP --name NAME --file-only")
+        return 1
     check(len(snapshot) > 0, "Footprints readable", f"{len(snapshot)} footprints")
     references = sorted(state["reference"] for state in snapshot.values())
     if references:

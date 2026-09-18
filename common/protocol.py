@@ -10,8 +10,8 @@ import time
 from typing import Any
 
 PROTOCOL_VERSION = "1.0.0"
-SERVER_VERSION = "1.0.0"
-AGENT_VERSION = "1.0.0"
+SERVER_VERSION = "2.0.0"
+AGENT_VERSION = "2.0.0"
 
 DEFAULT_PORT = 8000
 HEARTBEAT_INTERVAL = 10.0      # seconds between client heartbeats

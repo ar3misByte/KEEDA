@@ -23,8 +23,8 @@ import re
 import threading
 import time
 
-MAX_FILE_BYTES = 8 * 1024 * 1024
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,120}\.kicad_sch$")
+MAX_FILE_BYTES = 10 * 1024 * 1024
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()+-]{0,120}\.kicad_(?:sch|pcb)$")
 
 
 class SchematicFileError(ValueError):

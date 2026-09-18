@@ -1,5 +1,10 @@
 # KiCad Live
 
+> **v2.0** - near-live schematic sync (auto-save -> share -> merge -> auto-reload)
+> and a FILE-ONLY mode for computers where KiCad's API is busy/timing out.
+> Read [docs/LIVE_SCHEMATIC.md](docs/LIVE_SCHEMATIC.md) first.
+
+
 A collaborative project-management and synchronisation layer for **unmodified
 KiCad**. Multiple designers work on the same project at once, with presence,
 soft locks, conflict detection, object-attached comments, a persistent activity
