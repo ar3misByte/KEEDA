@@ -61,6 +61,8 @@ class SyncAgent:
         self._pending_state: dict | None = None
         # Remote changes KiCad could not accept yet, kept IN ORDER.
         self._deferred: list[tuple[list[dict], str]] = []
+        # File-level schematic sharing (set by main). None = disabled.
+        self.schematic_sync = None
 
     # ------------------------------------------------------------------ utils
 
@@ -106,6 +108,8 @@ class SyncAgent:
         self.state_ready.clear()
         self._pending_state = None
         self._deferred.clear()
+        if self.schematic_sync is not None:
+            self.schematic_sync.on_reconnect()
 
     async def _step(self) -> None:
         """One unit of work. Raises KiCadBusy / KiCadUnavailable on KiCad trouble."""
@@ -277,11 +281,14 @@ class SyncAgent:
         """
         if self.schematic is None or self.read_only:
             return
+        saved = self.schematic.changed_on_disk()
         try:
             changes = self.schematic.poll()
         except Exception:
             log.exception("schematic poll failed")
             return
+        if saved and self.schematic_sync is not None:
+            await self.schematic_sync.push_local()      # share the saved file itself
         if not changes:
             return
 
@@ -359,6 +366,18 @@ class SyncAgent:
         handler = getattr(self, f"_on_{message.get('type')}", None)
         if handler is not None:
             await handler(message)
+
+    async def _on_schematic_manifest(self, message: dict) -> None:
+        if self.schematic_sync is not None:
+            self.schematic_sync.on_manifest(message.get("files") or {})
+
+    async def _on_schematic_push_result(self, message: dict) -> None:
+        if self.schematic_sync is not None:
+            await self.schematic_sync.on_push_result(message)
+
+    async def _on_schematic_files(self, message: dict) -> None:
+        if self.schematic_sync is not None:
+            await self.schematic_sync.on_files(message)
 
     async def _on_welcome(self, message: dict) -> None:
         log.info("server %s accepted us; %d client(s) on '%s'",
@@ -537,8 +556,9 @@ class SyncAgent:
         for event in (summary.get("schematic") or [])[:8]:
             lines.append("   schematic: %s %s" % (event.get("username"), event.get("description")))
         if counts.get("schematic"):
-            lines.append("   Schematic edits are NOT applied to your editor: get the updated "
-                         ".kicad_sch from the author and reload it.")
+            lines.append("   Schematic edits are NOT applied to your open editor live: the updated "
+                         "file is copied to your project folder within a couple of minutes - "
+                         "then reload the sheet (File > Revert or reopen).")
         if counts.get("pcb"):
             lines.append("   PCB changes are applied to your board automatically.")
         self.banner("\n  ".join(lines))

@@ -84,6 +84,21 @@ class SchematicLink:
                 continue
         return tuple(signature)
 
+    def resync(self) -> None:
+        """Adopt the files on disk as the new baseline WITHOUT reporting changes.
+
+        Called after SchematicSync replaced a sheet with a teammate's version, so
+        their edit is not re-announced as if this user had made it.
+        """
+        if not self.connected:
+            return
+        try:
+            self.baseline = self._parse()
+        except (OSError, ValueError) as exc:
+            log.debug("resync could not parse yet (%s)", exc)
+            return
+        self._signature = self._current_signature()
+
     # ------------------------------------------------------------ detection
 
     def changed_on_disk(self) -> bool:

@@ -598,7 +598,8 @@ At startup it waits up to 60 s before giving up.
 shows up on this board.
 
 **Note on schematics**
-A schematic change made by someone else can never appear in your open eeschema
-(KiCad 10 has no API for it). When you connect, the agent prints what changed
-in the schematic while you were away; copy the updated `.kicad_sch` from the
-author and reload it.
+Other people's schematic changes cannot appear live in your open eeschema
+(KiCad 10 has no API for it). Instead the agent shares the saved `.kicad_sch`
+files every 2 minutes and writes teammates' sheets into your project folder;
+reload the sheet (File > Revert, or reopen) to see them. See
+`docs/SCHEMATIC.md` section 2b.

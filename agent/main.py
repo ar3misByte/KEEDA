@@ -19,6 +19,7 @@ if __package__ in (None, ""):
 
 from agent.kicad_link import KiCadBusy, KiCadLink, KiCadUnavailable
 from agent.schematic_link import SchematicLink, SchematicUnavailable
+from agent.schematic_sync import SchematicSync
 from agent.sync_agent import SyncAgent
 from agent.ws_client import WSClient
 from common.protocol import AGENT_VERSION, DEFAULT_PORT, POLL_INTERVAL
@@ -127,6 +128,14 @@ async def run(args) -> int:
     agent = SyncAgent(link, ws, args.name, read_only=args.read_only,
                       poll_interval=args.poll_interval, schematic=schematic)
 
+    if schematic is not None and args.schematic_sync_interval > 0:
+        agent.schematic_sync = SchematicSync(
+            schematic.project_dir, ws, args.name, read_only=args.read_only,
+            interval=args.schematic_sync_interval, banner=agent.banner,
+            on_applied=lambda names: schematic.resync())
+        print(f" Sch. share every {int(args.schematic_sync_interval)} s "
+              "(saved sheets are shared; teammates' sheets are written to your folder)")
+
     async def on_connect():
         # A fresh connection means our view may be stale; ask for the truth.
         agent.on_reconnect()
@@ -135,6 +144,8 @@ async def run(args) -> int:
     ws.on_connect = on_connect
 
     tasks = [asyncio.create_task(ws.run()), asyncio.create_task(agent.run())]
+    if agent.schematic_sync is not None:
+        tasks.append(asyncio.create_task(agent.schematic_sync.run()))
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -164,6 +175,9 @@ def main() -> int:
     parser.add_argument("--project-dir", default=None,
                         help="project folder holding the .kicad_sch "
                              "(default: the current directory)")
+    parser.add_argument("--schematic-sync-interval", type=float, default=120.0,
+                        help="seconds between schematic file refreshes from the team "
+                             "(default 120; 0 disables file sharing)")
     parser.add_argument("--no-schematic", action="store_true",
                         help="do not watch the schematic at all")
     parser.add_argument("--poll-interval", type=float, default=POLL_INTERVAL,

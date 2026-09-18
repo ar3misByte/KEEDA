@@ -24,3 +24,6 @@ fp-info-cache
 .idea/
 .DS_Store
 Thumbs.db
+
+# KiCad Live agent sync state and backups (per project folder)
+.kicad_live/

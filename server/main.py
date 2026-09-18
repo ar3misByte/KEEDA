@@ -35,6 +35,7 @@ from server.comments.manager import CommentError, CommentManager
 from server.database.db import Database
 from server.lock_manager import LockManager
 from server.project_analysis.summary import ProjectAnalyzer
+from server.schematic_files import SchematicFileError, SchematicFileStore
 from server.presence_manager import PresenceManager
 from server.project_manager import ProjectManager
 from server.version_manager import VersionManager
@@ -66,6 +67,7 @@ database = Database(os.path.join(DATA_DIR, "kicadlive.db"))
 events = EventManager(database)
 comments = CommentManager(database, events)
 analyzer = ProjectAnalyzer(PROJECT_DIR)
+schematic_files = SchematicFileStore(DATA_DIR)
 
 # Conflicts are transient, but the dashboard needs a live count.
 open_conflicts: dict[str, list[dict]] = {}
@@ -363,6 +365,8 @@ async def handle_hello(connection: Connection, message: dict) -> None:
     await send_project_state(connection)
     await sockets.send(connection, {"type": "history", "entries": versions.recent(project_id, 30)})
     await sockets.send(connection, {"type": "whats_new", "summary": whats_new})
+    await sockets.send(connection, {
+        "type": "schematic_manifest", "files": schematic_files.manifest(project_id)})
     await sockets.send(connection, {
         "type": "comments",
         "threads": comments.threads(project_id, viewer_id=client_id),
@@ -748,6 +752,48 @@ async def handle_conflict_resolve(connection: Connection, message: dict) -> None
     await push_history(connection.project_id, result["history"])
 
 
+async def handle_schematic_push(connection: Connection, message: dict) -> None:
+    """Store sheets the author saved so teammates' agents can fetch them."""
+    accepted, rejected = [], []
+    for item in (message.get("files") or [])[:32]:
+        name = item.get("name") if isinstance(item, dict) else None
+        try:
+            entry = schematic_files.put(
+                connection.project_id, name, item.get("content_b64"), item.get("sha256"),
+                item.get("base_sha256"), connection.user_name)
+            accepted.append({"name": name, "sha256": entry["sha256"], "rev": entry["rev"]})
+        except SchematicFileError as exc:
+            rejected.append({"name": name, "code": exc.code, "reason": str(exc)})
+    await sockets.send(connection, {"type": "schematic_push_result",
+                                    "accepted": accepted, "rejected": rejected})
+    if accepted:
+        log.info("[%s] %s shared schematic sheet(s): %s", connection.project_id,
+                 connection.user_name, ", ".join(a["name"] for a in accepted))
+        await sockets.broadcast(connection.project_id, {
+            "type": "schematic_manifest",
+            "files": schematic_files.manifest(connection.project_id)},
+            exclude_client=connection.client_id)
+
+
+async def handle_schematic_pull(connection: Connection, message: dict) -> None:
+    import base64
+    files = []
+    for name in (message.get("names") or [])[:32]:
+        found = schematic_files.get(connection.project_id, name)
+        if found is None:
+            continue
+        data, entry = found
+        files.append({"name": name, "sha256": entry["sha256"], "author": entry.get("author"),
+                      "rev": entry.get("rev"),
+                      "content_b64": base64.b64encode(data).decode("ascii")})
+    await sockets.send(connection, {"type": "schematic_files", "files": files})
+
+
+async def handle_request_schematic_manifest(connection: Connection, message: dict) -> None:
+    await sockets.send(connection, {
+        "type": "schematic_manifest", "files": schematic_files.manifest(connection.project_id)})
+
+
 async def handle_disconnect(connection: Connection, message: dict) -> None:
     await connection.websocket.close(code=1000)
 
@@ -761,6 +807,9 @@ HANDLERS = {
     "request_whats_new": handle_request_whats_new,
     "mark_read": handle_mark_read,
     "request_summary": handle_request_summary,
+    "schematic_push": handle_schematic_push,
+    "schematic_pull": handle_schematic_pull,
+    "request_schematic_manifest": handle_request_schematic_manifest,
     "presence": handle_presence,
     "request_state": handle_request_state,
     "request_history": handle_request_history,

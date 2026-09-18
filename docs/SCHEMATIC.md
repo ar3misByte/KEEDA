@@ -136,6 +136,42 @@ formatting churn never looks like an edit.
 
 ---
 
+## 2b. Workaround: schematic FILE sharing on a timer
+
+Objects cannot be pushed into a running eeschema, but **files can be
+exchanged**. Each agent now shares saved sheets through the server:
+
+1. You save the schematic (Ctrl+S). Within about a second the agent uploads
+   the `.kicad_sch` to the server.
+2. Every **2 minutes** (`--schematic-sync-interval 120`, `0` turns it off) and
+   when it connects, each teammate's agent downloads newer sheets and writes
+   them into **their own project folder** (atomically).
+3. The teammate reloads the sheet in eeschema (**File > Revert**, or close and
+   reopen it - the exact menu name depends on your KiCad build).
+
+So a schematic edit reaches a teammate's disk within the interval and their
+screen when they reload. It is not live, and no tool can make it live.
+
+**Nothing is overwritten silently**
+
+| Situation | What happens |
+|---|---|
+| Your sheet is unchanged since the last sync | Replaced by the team's; the old file is backed up to `.kicad_live/backup/` |
+| First time you join and your copy differs | The team's copy is adopted; yours is backed up |
+| You AND a teammate both edited the sheet | Your file is left alone; theirs goes to `.kicad_live/incoming/`; a banner tells you. Merge by hand and save; your merged save is then shared |
+| You save an old version after a teammate's newer one | The server rejects the upload (stale base); you are told |
+| A save is caught half-written | Ignored until it is complete |
+
+**Rule of thumb:** after a "written to your project folder" banner, reload the
+sheet *before* you edit or save. Saving the old in-memory copy is treated as a
+conflicting edit.
+
+Server copies live in `data/schematics/<project>/` and survive restarts.
+Unit tests: `tests/unit/test_schematic_sync.py`; server integration:
+`tests/integration/test_schematic_files_integration.py`. What has NOT been
+verified: reloading via the eeschema menu on a real KiCad, and a real
+multi-computer run.
+
 ## 3. Schematic locks
 
 Locks are keyed by `(domain, object id)`, so schematic and PCB locks are
