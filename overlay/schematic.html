@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schematic - KiCad Live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="schematic">
+
+<div class="brand">
+  <span class="logo">&#9672;</span>
+  <div><h1>KiCad Live</h1><p>Project manager</p></div>
+</div>
+
+<div class="topbar">
+  <div class="project"><span>Project</span><b id="project-name">-</b></div>
+  <div class="right">
+    <span class="pill" id="online-count">0 online</span>
+    <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting...</span></span>
+  </div>
+</div>
+
+<nav></nav>
+
+<main>
+<h2 class="page-title">Schematic</h2>
+<p class="page-sub">Symbols, sheets, locks and comments. Click any row to comment on it.</p>
+
+<div class="note">
+  KiCad 10's schematic editor does not expose an IPC API, so schematic changes are
+  <strong>detected and reviewed, never applied</strong> to anyone's eeschema. Edits appear
+  here once the author saves.
+</div>
+
+<div class="filters">
+  <div class="spacer"></div>
+  <span class="pill" id="obj-count">0 objects</span>
+</div>
+
+<div class="card">
+  <table class="data">
+    <thead><tr><th>Reference</th><th>Value</th><th>Sheet</th><th>Footprint</th><th>Status</th></tr></thead>
+    <tbody id="objects"></tbody>
+  </table>
+</div>
+
+</main>
+
+<div class="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

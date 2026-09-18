@@ -20,8 +20,25 @@ LOCK_TTL = 120.0               # seconds before an unrefreshed lock expires
 POLL_INTERVAL = 0.25           # agent board poll period
 MAX_MESSAGES_PER_SECOND = 200
 
-# Fields of a footprint that we synchronise.
+# Fields of a PCB footprint that we synchronise live.
 SYNCED_FIELDS = ("position", "rotation", "layer", "value", "reference")
+
+# Domains. "pcb" is the default everywhere so existing clients are unchanged.
+DOMAIN_PCB = "pcb"
+DOMAIN_SCHEMATIC = "schematic"
+DOMAINS = (DOMAIN_PCB, DOMAIN_SCHEMATIC)
+
+# Schematic fields KiCad Live reports. Schematic changes are REPORTED, never
+# applied: eeschema does not expose an IPC API in KiCad 10, so there is no safe
+# way to write into a running schematic editor. See docs/SCHEMATIC.md.
+SCHEMATIC_FIELDS = ("reference", "value", "lib_id", "position", "rotation",
+                    "mirror", "unit", "dnp", "footprint", "text",
+                    "start", "end", "sheet_name", "sheet_file")
+
+SCHEMATIC_OBJECT_TYPES = ("symbol", "wire", "junction", "local_label",
+                          "global_label", "hierarchical_label", "sheet")
+
+ROLES = ("manager", "designer", "viewer")
 
 ACTIVITIES = ("idle", "viewing", "editing", "routing", "offline")
 OPERATIONS = ("add", "modify", "remove")
@@ -106,6 +123,19 @@ def validate_message(raw: Any) -> dict:
     return raw
 
 
+def validate_domain(value: Any) -> str:
+    """Domain of an object. Absent means PCB, so older agents keep working."""
+    if value is None:
+        return DOMAIN_PCB
+    if value not in DOMAINS:
+        raise ValidationError(f"invalid domain: {value!r}")
+    return value
+
+
+def validate_role(value: Any) -> str:
+    return value if value in ROLES else "designer"
+
+
 def validate_change(raw: Any) -> dict:
     """Validate one entry of a `change` message's `changes` list."""
     if not isinstance(raw, dict):
@@ -115,16 +145,23 @@ def validate_change(raw: Any) -> dict:
     if operation not in OPERATIONS:
         raise ValidationError(f"invalid operation: {operation!r}")
 
+    domain = validate_domain(raw.get("domain"))
+    allowed_fields = SCHEMATIC_FIELDS if domain == DOMAIN_SCHEMATIC else SYNCED_FIELDS
+
     out: dict[str, Any] = {
         "operation": operation,
-        "object_type": raw.get("object_type", "footprint"),
+        "domain": domain,
+        "object_type": raw.get("object_type",
+                               "symbol" if domain == DOMAIN_SCHEMATIC else "footprint"),
         "uuid": validate_uuid(raw.get("uuid")),
         "reference": str(raw.get("reference", ""))[:32],
     }
+    if domain == DOMAIN_SCHEMATIC:
+        out["sheet"] = str(raw.get("sheet", "/"))[:120]
 
     if operation == "modify":
         field = raw.get("field")
-        if field not in SYNCED_FIELDS:
+        if field not in allowed_fields:
             raise ValidationError(f"invalid or unsupported field: {field!r}")
         out["field"] = field
         out["old"] = raw.get("old")

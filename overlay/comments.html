@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comments - KiCad Live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="comments">
+
+<div class="brand">
+  <span class="logo">&#9672;</span>
+  <div><h1>KiCad Live</h1><p>Project manager</p></div>
+</div>
+
+<div class="topbar">
+  <div class="project"><span>Project</span><b id="project-name">-</b></div>
+  <div class="right">
+    <span class="pill" id="online-count">0 online</span>
+    <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting...</span></span>
+  </div>
+</div>
+
+<nav></nav>
+
+<main>
+<h2 class="page-title">Comments</h2>
+<p class="page-sub">Review discussions attached to real schematic symbols and PCB footprints.</p>
+
+<div class="card" style="margin-bottom:16px">
+  <h3>New comment</h3>
+  <form id="c-new">
+    <div class="filters" style="margin-bottom:10px">
+      <select id="c-domain">
+        <option value="schematic">Schematic</option>
+        <option value="pcb">PCB</option>
+      </select>
+      <input type="text" id="c-object" list="object-list" placeholder="Object, e.g. R1" style="min-width:200px">
+      <datalist id="object-list"></datalist>
+    </div>
+    <textarea id="c-text" placeholder="What needs checking?"></textarea>
+    <div style="margin-top:10px"><button class="primary" type="submit">Post comment</button></div>
+  </form>
+</div>
+
+<div class="filters">
+  <select id="c-filter">
+    <option value="all">All</option>
+    <option value="open">Open</option>
+    <option value="resolved">Resolved</option>
+    <option value="mine">Mine</option>
+  </select>
+  <div class="spacer"></div>
+  <span class="pill" id="c-count">0 threads</span>
+</div>
+
+<div id="threads"></div>
+
+</main>
+
+<div class="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

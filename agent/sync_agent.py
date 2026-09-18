@@ -13,17 +13,21 @@ import uuid as uuidlib
 from common.diff_engine import apply_change, diff_snapshots, summarise
 from common.protocol import POLL_INTERVAL, SYNCED_FIELDS
 from agent.kicad_link import KiCadLink, KiCadUnavailable
+from agent.schematic_link import SchematicLink, SchematicUnavailable
 from agent.ws_client import WSClient
 
 log = logging.getLogger("kicadlive.agent")
 
 SELECTION_EVERY = 2          # poll selection every Nth board poll
+SCHEMATIC_EVERY = 4          # check schematic files every Nth poll (~1 s)
 
 
 class SyncAgent:
     def __init__(self, link: KiCadLink, ws: WSClient, user_name: str,
-                 read_only: bool = False, poll_interval: float = POLL_INTERVAL):
+                 read_only: bool = False, poll_interval: float = POLL_INTERVAL,
+                 schematic: SchematicLink | None = None):
         self.link = link
+        self.schematic = schematic
         self.ws = ws
         self.user_name = user_name
         self.read_only = read_only
@@ -47,7 +51,8 @@ class SyncAgent:
         self.state_ready = asyncio.Event()
         self.change_counter = 0
         self.run_token = uuidlib.uuid4().hex[:6]
-        self.stats = {"sent": 0, "received": 0, "conflicts": 0, "blocked": 0}
+        self.stats = {"sent": 0, "received": 0, "conflicts": 0, "blocked": 0,
+                      "schematic_sent": 0}
         self._tick = 0
 
     # ------------------------------------------------------------------ utils
@@ -132,6 +137,9 @@ class SyncAgent:
         if self._tick % SELECTION_EVERY == 0:
             await self.poll_selection()
 
+        if self.schematic is not None and self._tick % SCHEMATIC_EVERY == 0:
+            await self.poll_schematic()
+
     def _expire_echo_marks(self) -> None:
         """Drop echo marks that have already survived a full poll cycle.
 
@@ -213,6 +221,53 @@ class SyncAgent:
             self.stats["sent"] += len(outgoing)
             for change in outgoing:
                 log.info("LOCAL  %s", summarise(change))
+
+    # ------------------------------------------------------------- schematic
+
+    async def poll_schematic(self) -> None:
+        """Report schematic edits after the author saves.
+
+        Read-only by design: schematic changes are broadcast for review, never
+        applied to anyone's eeschema. See agent/schematic_link.py for why.
+        """
+        if self.schematic is None or self.read_only:
+            return
+        try:
+            changes = self.schematic.poll()
+        except Exception:
+            log.exception("schematic poll failed")
+            return
+        if not changes:
+            return
+
+        outgoing = []
+        for change in changes:
+            uuid = change.get("uuid")
+            lock = self.locks.get(f"schematic:{uuid}")
+            if lock is not None and lock.get("owner") != self.ws.client_id:
+                # We cannot revert a schematic (no write path), so warn loudly
+                # instead - the other designer owns this part.
+                self.stats["blocked"] += 1
+                self.banner(f"{change.get('reference') or uuid[:8]} is locked by "
+                            f"{lock.get('owner_name')} in the schematic. Your edit was "
+                            f"NOT shared - coordinate before saving again.")
+                continue
+            change["base_version"] = 0     # schematic state is report-only
+            outgoing.append(change)
+
+        if not outgoing:
+            return
+
+        await self.ws.send({
+            "type": "change", "client_id": self.ws.client_id,
+            "change_id": self._next_change_id(), "domain": "schematic",
+            "changes": outgoing,
+        })
+        self.stats["schematic_sent"] += len(outgoing)
+        for change in outgoing[:8]:
+            log.info("SCHEM  %s", self.schematic.describe(change))
+        if len(outgoing) > 8:
+            log.info("SCHEM  ... and %d more", len(outgoing) - 8)
 
     # ------------------------------------------------------------- selection
 
@@ -337,6 +392,20 @@ class SyncAgent:
     async def _on_remote_change(self, message: dict) -> None:
         changes = message.get("changes") or []
         origin = message.get("origin_user_name", "someone")
+
+        # Schematic changes are REPORTED, never applied: eeschema has no IPC
+        # API, and writing the .kicad_sch under a running editor would be
+        # overwritten on the author's next save. Surface them instead.
+        schematic_changes = [c for c in changes if c.get("domain") == "schematic"]
+        if schematic_changes:
+            for change in schematic_changes[:6]:
+                log.info("SCHEM  %s changed %s (%s) - review in your schematic editor",
+                         origin, change.get("reference") or change.get("uuid", "")[:8],
+                         change.get("field") or change.get("operation"))
+            self.stats["received"] += len(schematic_changes)
+            changes = [c for c in changes if c.get("domain") != "schematic"]
+            if not changes:
+                return
         for change in changes:
             for field in ("field",):
                 if change.get(field):

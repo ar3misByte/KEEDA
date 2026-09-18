@@ -47,7 +47,8 @@ one-time preference toggle. Both are documented in `GETTING_STARTED.md`.
 * No CRDT. Conflicts are detected by per-object version numbers and, when they
   cannot be resolved safely, **handed back to the humans**.
 * No automatic merge of two conflicting edits to the same field.
-* Schematic sync is a **stretch goal**, not MVP — see section 12.
+* No live schematic editing. KiCad 10's eeschema exposes no IPC API, so
+  schematic collaboration is review-only — see section 12 and Part 2.
 
 ---
 
@@ -331,12 +332,19 @@ the demo must not fail because a Git identity is unconfigured.
 server state and discards its own divergent baseline. A client that was offline
 cannot overwrite work done while it was away.
 
-## 12. Scope: PCB now, schematic later
+## 12. Scope: PCB live, schematic reviewed
 
-PCB collaboration is the MVP because the IPC API exposes board objects richly
-and the result is visually obvious in a demo. The schematic API surface is
-narrower in KiCad 10, so **schematic sync is a stretch goal** and is not
-required for any milestone or demo scene.
+PCB collaboration is live because the IPC API exposes board objects richly and
+the result is visually obvious.
+
+Schematic collaboration is **detect / broadcast / lock / comment**, not live
+editing. This is forced by KiCad, not chosen: eeschema implements no IPC API in
+KiCad 10.0.6, so there is no way to write into a running schematic editor, and
+writing the file underneath it would be overwritten on the author's next save.
+
+Part 2 (section 15 onwards) covers how the schematic engine, comments, activity
+and hardware summary are built on top of this core. Full evidence for the API
+finding is in `docs/SCHEMATIC.md`.
 
 ## 13. Recommended deployment for the five-computer demo
 
@@ -364,3 +372,181 @@ the configured project directory with path-traversal rejection, clients cannot
 name arbitrary paths, and no client input is ever passed to a shell.
 
 **Do not run this on an untrusted or public network.**
+
+---
+
+# Part 2 — The collaboration layer
+
+Everything above describes the PCB synchronisation core. This part covers the
+project-management layer added on top of it. **None of it changes the PCB
+path**: the 99 tests that covered PCB sync before this work still pass
+unmodified.
+
+## 15. Two domains, one infrastructure
+
+```text
+                      Sync Service
+                           |
+            +--------------+--------------+
+            |                             |
+            v                             v
+     Schematic Engine                 PCB Engine
+   server/schematic/                (project_manager +
+   parser.py  diff.py                common/diff_engine)
+            |                             |
+            v                             v
+   file-based, READ ONLY           IPC-based, live read/write
+   detected on save                detected by 250 ms poll
+```
+
+The two engines are deliberately separate. Schematic objects (symbols, wires,
+labels, sheets) and board objects (footprints, tracks, zones) are genuinely
+different, and one parser that tried to treat them alike would make both worse.
+
+What **is** shared: connections, presence, locks, the event system, comments,
+versioning and the dashboard. A lock is a lock whichever domain it names.
+
+### Why schematic is file-based
+
+KiCad 10's eeschema implements no IPC API. Verified by probe, not assumption:
+`GetOpenDocuments`, `GetItems` and `GetSelection` on a schematic document all
+return *"no handler available"*, the shipped `schematic_commands_pb2` contains
+no commands at all, and there is no symbol type in the schematic protobufs.
+`docs/SCHEMATIC.md` has the full evidence.
+
+Writing the `.kicad_sch` under a running eeschema was rejected: eeschema holds
+its own in-memory copy and would overwrite the file on the author's next
+Ctrl+S, silently destroying work. **KiCad Live opens schematics read-only.**
+
+## 16. Domain-aware locks
+
+Locks are keyed by `(domain, object id)`:
+
+```text
+locks["demo_board"]["schematic:33c18730-..."] -> Aditya
+locks["demo_board"]["pcb:33c18730-..."]       -> Rahul
+```
+
+Both can be held at once, by different people, on the same component. That is
+correct: working on a symbol and working on its footprint are different jobs.
+
+`domain` defaults to `"pcb"` everywhere, so an older agent that never sends the
+field behaves exactly as before.
+
+## 17. The unified event system
+
+```text
+PCB change ----+
+Schematic save-+
+Lock taken ----+--> EventManager.record() --> SQLite events table
+Conflict ------+                                    |
+Comment -------+                    +---------------+---------------+
+                                    |               |               |
+                                    v               v               v
+                              Dashboard      "What changed      Change
+                              timeline        since I left?"    inspector
+```
+
+Every event carries: timestamp, user, **domain**, object type, object id,
+object reference, action, field, before, after, description and version.
+
+Events are **recorded first and broadcast second**, so a dropped WebSocket
+frame can never lose history. Recording never raises into the caller —
+activity is valuable, but it must not be able to break synchronisation.
+
+## 18. Persistence
+
+SQLite, one file, no server process, nothing to install:
+
+| Persisted | Ephemeral by design |
+|---|---|
+| projects, users, sessions | locks |
+| events (the activity timeline) | presence |
+| comments and replies | in-memory board state |
+| versions | |
+| per-user read markers | |
+
+Locks and presence describe who is holding something *right now*. Restoring
+them after a restart would resurrect locks owned by nobody, so they are
+deliberately not persisted.
+
+Version numbering **continues** across a restart rather than resetting, so a
+version number always identifies one specific change.
+
+## 19. Comments
+
+A comment is anchored to an object, never free-floating:
+
+```json
+{
+  "domain": "schematic", "object_type": "symbol",
+  "object_id": "...", "object_ref": "R1",
+  "author_name": "Aditya", "text": "Should this be 4.7k?",
+  "status": "open", "parent_id": null
+}
+```
+
+Threads are **one level deep**: a comment on an object, and replies to it. A
+reply to a reply joins the original thread. A reply inherits its thread's
+target, so a thread can never span two objects.
+
+Comments live only in KiCad Live's database. **Commenting can never modify or
+corrupt a design.**
+
+## 20. The hardware summary engine
+
+```text
+.kicad_sch --> kicad-cli sch export netlist --format kicadxml
+                        |                  (KiCad's own connectivity engine)
+                        v
+              components / nets / pins / pin functions
+                        |
+        +---------------+---------------+
+        v               v               v
+  component_analyzer  net_analyzer   pcb_analyzer  <-- .kicad_pcb parsed directly
+        |               |               |
+        +---------------+---------------+
+                        v
+                    summary.py  --> headline + evidence
+```
+
+Two rules govern it:
+
+1. **Connectivity is never re-derived.** `kicad-cli` reports what KiCad's own
+   engine computed. Reimplementing wire tracing would be slower to write and
+   less correct.
+2. **Every claim carries its evidence, and no evidence means no claim.** An
+   interface is reported only when the schematic names those signals or their
+   pin functions. A part being *capable* of USB is not evidence of USB.
+   Unknowns read `Not available` with a reason.
+
+**No network access and no AI service.** Proven, not asserted: a test blocks
+`socket.socket` entirely and the summary still succeeds, and a second test
+fails if any module in `server/project_analysis/` ever imports an HTTP client.
+
+## 21. Dashboard architecture
+
+```text
+Browser
+  |  REST (page loads, history queries)      GET /api/overview, /activity,
+  |------------------------------------>         /comments, /summary, ...
+  |
+  |  WebSocket (live deltas)                presence_update, lock_update,
+  |<------------------------------------    activity, comment_created,
+                                            conflict_event, blocked_event
+```
+
+One socket, already built for synchronisation, carries the live updates; REST
+serves the request/response queries that are easier to cache and debug over
+HTTP.
+
+The frontend is **dependency-free vanilla JavaScript**: no framework, no build
+step, no CDN. Five demo machines should need nothing installed beyond a
+browser, and the page must load with the internet disconnected.
+
+## 22. Roles
+
+`manager`, `designer`, `viewer` — stored per user per project, and used to
+label the UI. **They are not security.** There is no authentication; anyone who
+can reach the port can connect as anyone. This remains a LAN prototype, and the
+docs say so wherever roles are mentioned.

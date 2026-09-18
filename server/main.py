@@ -19,15 +19,22 @@ if __package__ in (None, ""):
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from common.protocol import (
     DEFAULT_PORT, HEARTBEAT_INTERVAL, SERVER_VERSION, ValidationError,
-    error_message, now, validate_client_id, validate_change, validate_message,
-    validate_project_id, validate_user_name, validate_uuid,
+    error_message, now, validate_client_id, validate_change, validate_domain,
+    validate_message, validate_project_id, validate_role, validate_user_name,
+    validate_uuid,
 )
+from server.activity.event_manager import EventManager
+from server.api import build_router
+from server.comments.manager import CommentError, CommentManager
+from server.database.db import Database
 from server.lock_manager import LockManager
+from server.project_analysis.summary import ProjectAnalyzer
 from server.presence_manager import PresenceManager
 from server.project_manager import ProjectManager
 from server.version_manager import VersionManager
@@ -36,6 +43,9 @@ from server.websocket_manager import Connection, WebSocketManager
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OVERLAY_DIR = os.path.join(ROOT, "overlay")
 DATA_DIR = os.environ.get("KICADLIVE_DATA_DIR", os.path.join(ROOT, "data"))
+# Where the KiCad project lives, for the hardware summary and schematic view.
+PROJECT_DIR = os.environ.get("KICADLIVE_PROJECT_DIR",
+                             os.path.join(ROOT, "sample_project"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +61,60 @@ projects = ProjectManager(versions)
 locks = LockManager()
 presence = PresenceManager()
 sockets = WebSocketManager()
+
+database = Database(os.path.join(DATA_DIR, "kicadlive.db"))
+events = EventManager(database)
+comments = CommentManager(database, events)
+analyzer = ProjectAnalyzer(PROJECT_DIR)
+
+# Conflicts are transient, but the dashboard needs a live count.
+open_conflicts: dict[str, list[dict]] = {}
+# client_id -> database session id, so sessions can be closed on disconnect.
+client_sessions: dict[str, str] = {}
+
+
+class ServerContext:
+    """What the REST API needs from the server, in one place."""
+
+    server_version = SERVER_VERSION
+    db = database
+    events = events
+    comments = comments
+    locks = locks
+    presence = presence
+    analyzer = analyzer
+
+    @staticmethod
+    def day_start() -> float:
+        import datetime as _dt
+        midnight = _dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp()
+
+    @staticmethod
+    def events_today(project_id: str) -> int:
+        return len(database.events(project_id, limit=1000,
+                                   since_ts=ServerContext.day_start()))
+
+    @staticmethod
+    def conflict_count(project_id: str) -> int:
+        return len(open_conflicts.get(project_id, []))
+
+    @staticmethod
+    def project_version(project_id: str) -> int:
+        return projects.get(project_id).version
+
+    @staticmethod
+    def project_dir_for(project_id: str) -> str:
+        return PROJECT_DIR
+
+    @staticmethod
+    def pcb_objects(project_id: str) -> list[dict]:
+        project = projects.get(project_id)
+        return sorted(project.objects.values(),
+                      key=lambda o: o.get("reference", ""))
+
+
+context = ServerContext()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -106,6 +170,20 @@ async def dashboard():
     return JSONResponse({"status": "ok", "message": "dashboard not installed"})
 
 
+app.include_router(build_router(context))
+
+
+@app.get("/{page}.html")
+async def dashboard_page(page: str):
+    """Serve the dashboard's other pages (activity, comments, project...)."""
+    if not page.replace("_", "").isalnum():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    candidate = os.path.join(OVERLAY_DIR, f"{page}.html")
+    if os.path.exists(candidate):
+        return FileResponse(candidate)
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
 if os.path.isdir(OVERLAY_DIR):
     app.mount("/static", StaticFiles(directory=OVERLAY_DIR), name="static")
 
@@ -148,8 +226,16 @@ async def websocket_endpoint(websocket: WebSocket):
             except WebSocketDisconnect:
                 raise
             except Exception:
-                await sockets.send(connection, error_message(
-                    "invalid_message", "frame was not valid JSON"))
+                # Starlette raises a plain RuntimeError once the peer has gone
+                # away, NOT WebSocketDisconnect. Treating that as "malformed
+                # frame" and replying puts this loop into a tight spin that
+                # starves the event loop and hangs the whole server, so check
+                # the socket state before assuming the frame was just bad.
+                if websocket.client_state is not WebSocketState.CONNECTED:
+                    raise WebSocketDisconnect(code=1006) from None
+                if not await sockets.send(connection, error_message(
+                        "invalid_message", "frame was not valid JSON")):
+                    raise WebSocketDisconnect(code=1006) from None
                 continue
 
             if connection.rate_limited():
@@ -192,6 +278,14 @@ async def cleanup_connection(websocket: WebSocket) -> None:
 
     presence.mark_offline(client_id)
     released = locks.release_all_for_client(client_id)
+
+    session_id = client_sessions.pop(client_id, None)
+    if session_id:
+        database.end_session(session_id)
+    if not connection.is_dashboard:
+        events.record(project_id, "project", "disconnected", "left the project",
+                      user_id=client_id, username=connection.user_name)
+
     await broadcast_presence(project_id)
     if released:
         await broadcast_locks(project_id)
@@ -242,8 +336,19 @@ async def handle_hello(connection: Connection, message: dict) -> None:
 
     project = projects.get(project_id)
 
+    database.ensure_project(project_id)
+    role = validate_role(message.get("role"))
+    user = database.ensure_user(project_id, client_id, user_name, role)
+
+    # "What changed since I left?" must be computed BEFORE this session's own
+    # events start landing, or the user's own arrival shows up in it.
+    whats_new = events.since_last_read(project_id, client_id)
+
     if not connection.is_dashboard:
         presence.register(client_id, user_name, project_id)
+        client_sessions[client_id] = database.start_session(project_id, client_id, user_name)
+        events.record(project_id, "project", "connected", "joined the project",
+                      user_id=client_id, username=user_name)
 
     await sockets.send(connection, {
         "type": "welcome",
@@ -253,9 +358,17 @@ async def handle_hello(connection: Connection, message: dict) -> None:
         "heartbeat_interval": HEARTBEAT_INTERVAL,
         "client_count": sockets.count(project_id),
         "needs_seed": not project.seeded,
+        "role": user.get("role", "designer"),
     })
     await send_project_state(connection)
     await sockets.send(connection, {"type": "history", "entries": versions.recent(project_id, 30)})
+    await sockets.send(connection, {"type": "whats_new", "summary": whats_new})
+    await sockets.send(connection, {
+        "type": "comments",
+        "threads": comments.threads(project_id, viewer_id=client_id),
+        "counts": comments.counts(project_id)})
+    await sockets.send(connection, {"type": "activity",
+                                    "events": events.recent(project_id, limit=40)})
     await broadcast_presence(project_id)
     await broadcast_locks(project_id)
 
@@ -305,31 +418,55 @@ async def handle_request_history(connection: Connection, message: dict) -> None:
 async def handle_lock_request(connection: Connection, message: dict) -> None:
     uuid = validate_uuid(message.get("uuid"))
     reference = str(message.get("reference", ""))[:32]
+    domain = validate_domain(message.get("domain"))
+    object_type = str(message.get("object_type")
+                      or ("symbol" if domain == "schematic" else "footprint"))[:32]
+
     granted, lock = locks.request(
-        connection.project_id, uuid, reference, connection.client_id, connection.user_name)
+        connection.project_id, uuid, reference, connection.client_id,
+        connection.user_name, domain=domain, object_type=object_type)
 
     if granted:
         await sockets.send(connection, {
             "type": "lock_granted", "uuid": uuid, "reference": lock.reference,
-            "owner": lock.owner, "expires_in": round(lock.expires_at - now(), 1),
+            "domain": domain, "owner": lock.owner,
+            "expires_in": round(lock.expires_at - now(), 1),
         })
+        events.record(connection.project_id, "collab", "lock_acquired",
+                      f"locked {domain} {reference or uuid[:8]}",
+                      user_id=connection.client_id, username=connection.user_name,
+                      object_type=object_type, object_id=uuid, object_ref=reference)
         await broadcast_locks(connection.project_id)
     else:
         await sockets.send(connection, {
             "type": "lock_denied", "uuid": uuid, "reference": lock.reference or reference,
-            "owner": lock.owner, "owner_name": lock.owner_name, "reason": "locked_by_other",
+            "domain": domain, "owner": lock.owner, "owner_name": lock.owner_name,
+            "reason": "locked_by_other",
         })
-        log.info("[%s] LOCK DENIED %s to %s (held by %s)",
-                 connection.project_id, reference or uuid[:8],
+        events.record(connection.project_id, "collab", "lock_denied",
+                      f"was blocked from {reference or uuid[:8]} "
+                      f"(locked by {lock.owner_name})",
+                      user_id=connection.client_id, username=connection.user_name,
+                      object_type=object_type, object_id=uuid, object_ref=reference)
+        log.info("[%s] LOCK DENIED %s/%s to %s (held by %s)",
+                 connection.project_id, domain, reference or uuid[:8],
                  connection.user_name, lock.owner_name)
 
 
 async def handle_lock_release(connection: Connection, message: dict) -> None:
     raw_uuid = message.get("uuid")
+    domain = validate_domain(message.get("domain"))
     if raw_uuid is None:
         released = bool(locks.release_all_for_client(connection.client_id))
     else:
-        released = locks.release(connection.project_id, validate_uuid(raw_uuid), connection.client_id)
+        uuid = validate_uuid(raw_uuid)
+        released = locks.release(connection.project_id, uuid, connection.client_id,
+                                 domain=domain)
+        if released:
+            events.record(connection.project_id, "collab", "lock_released",
+                          f"released {domain} {message.get('reference') or uuid[:8]}",
+                          user_id=connection.client_id, username=connection.user_name,
+                          object_id=uuid, object_ref=message.get("reference"))
     if released:
         await broadcast_locks(connection.project_id)
 
@@ -344,6 +481,23 @@ async def handle_change(connection: Connection, message: dict) -> None:
     changes = [validate_change(entry) for entry in raw_changes]
     change_id = str(message.get("change_id", ""))[:64]
     project_id = connection.project_id
+
+    # Schematic changes are REPORTED, not synchronised: there is no way to
+    # apply them to a running eeschema, so they bypass the PCB state machine
+    # entirely and become activity + broadcast only.
+    schematic_changes = [c for c in changes if c.get("domain") == "schematic"]
+    changes = [c for c in changes if c.get("domain") != "schematic"]
+
+    if schematic_changes:
+        await handle_schematic_changes(connection, schematic_changes)
+        if not changes:
+            await sockets.send(connection, {
+                "type": "change_ack", "change_id": change_id,
+                "accepted": [{"uuid": c["uuid"], "field": c.get("field"), "version": 0}
+                             for c in schematic_changes],
+                "rejected": [], "duplicate": False,
+            })
+            return
 
     result = projects.submit(
         project_id, connection.client_id, connection.user_name, change_id, changes,
@@ -362,6 +516,17 @@ async def handle_change(connection: Connection, message: dict) -> None:
         await sockets.send(connection, {
             "type": "conflict", "change_id": change_id, "conflicts": result["conflicts"],
         })
+        for conflict in result["conflicts"]:
+            open_conflicts.setdefault(project_id, []).append(conflict)
+            events.record(project_id, "collab", "conflict_detected",
+                          f"conflicted with {conflict['conflicting_user']} over "
+                          f"{conflict['reference'] or conflict['uuid'][:8]}.{conflict['field']}",
+                          user_id=connection.client_id, username=connection.user_name,
+                          object_id=conflict["uuid"], object_ref=conflict["reference"],
+                          field=conflict["field"],
+                          old_value=conflict.get("server_value"),
+                          new_value=conflict.get("your_value"))
+
         # Also tell everyone a conflict happened, so the dashboard can show it.
         # This carries no board data, only who collided over what.
         await sockets.broadcast(project_id, {
@@ -392,7 +557,160 @@ async def handle_change(connection: Connection, message: dict) -> None:
         log.info("[%s] BROADCAST %d change(s) from %s to %d client(s)",
                  project_id, len(result["broadcast"]), connection.user_name, count)
 
+    # Seeding a fresh project is bulk data, not interesting activity.
+    for entry in result["history"]:
+        events.record(project_id, "pcb", "modified", entry.get("summary", "changed the board"),
+                      user_id=connection.client_id, username=connection.user_name,
+                      object_type=entry.get("object_type"), object_id=entry.get("uuid"),
+                      object_ref=entry.get("reference"), field=entry.get("field"),
+                      old_value=entry.get("old"), new_value=entry.get("new"),
+                      version=entry.get("version"))
+        database.add_version(project_id, "pcb", int(entry.get("version") or 0),
+                             connection.client_id, connection.user_name,
+                             entry.get("summary", ""))
+
     await push_history(project_id, result["history"])
+
+
+async def handle_schematic_changes(connection: Connection, changes: list[dict]) -> None:
+    """Record and broadcast schematic edits.
+
+    These are review events, not synchronisation: KiCad 10's eeschema has no
+    IPC API, so nobody's schematic is modified. Everyone is told what changed
+    and by whom, and the object can be locked and commented on.
+    """
+    from server.schematic.diff import summarise as summarise_schematic
+
+    project_id = connection.project_id
+    project = projects.get(project_id)
+    recorded = []
+
+    for change in changes:
+        # A locked schematic object belongs to someone else; report the clash
+        # rather than pretending the edit is shared.
+        lock = locks.is_blocked_for(project_id, change["uuid"],
+                                    connection.client_id, domain="schematic")
+        summary = summarise_schematic(change)
+        if lock is not None:
+            events.record(project_id, "collab", "lock_denied",
+                          f"edited {change.get('reference') or change['uuid'][:8]} in the "
+                          f"schematic, which is locked by {lock.owner_name}",
+                          user_id=connection.client_id, username=connection.user_name,
+                          object_type=change.get("object_type"), object_id=change["uuid"],
+                          object_ref=change.get("reference"))
+            await sockets.send(connection, {
+                "type": "lock_denied", "uuid": change["uuid"], "domain": "schematic",
+                "reference": change.get("reference", ""), "owner": lock.owner,
+                "owner_name": lock.owner_name, "reason": "locked_by_other",
+            })
+            continue
+
+        project.version += 1
+        event = events.record_change(project_id, "schematic", connection.client_id,
+                                     connection.user_name, change, summary,
+                                     version=project.version)
+        database.add_version(project_id, "schematic", project.version,
+                             connection.client_id, connection.user_name, summary)
+        if event:
+            recorded.append(event)
+
+    if not recorded:
+        return
+
+    await sockets.broadcast(project_id, {
+        "type": "remote_change",
+        "origin_client_id": connection.client_id,
+        "origin_user_name": connection.user_name,
+        "domain": "schematic",
+        "changes": [{**c, "domain": "schematic"} for c in changes],
+    }, exclude_client=connection.client_id)
+    await sockets.broadcast(project_id, {"type": "activity", "events": recorded})
+    log.info("[%s] SCHEMATIC %d change(s) from %s",
+             project_id, len(recorded), connection.user_name)
+
+
+async def handle_comment_create(connection: Connection, message: dict) -> None:
+    try:
+        comment = comments.create(
+            project_id=connection.project_id,
+            domain=validate_domain(message.get("domain")),
+            object_id=str(message.get("object_id", ""))[:64],
+            text=str(message.get("text", "")),
+            author_id=connection.client_id,
+            author_name=connection.user_name,
+            object_type=str(message.get("object_type", ""))[:32] or None,
+            object_ref=str(message.get("object_ref", ""))[:32] or None,
+            sheet=str(message.get("sheet", ""))[:120] or None,
+            parent_id=str(message.get("parent_id", ""))[:32] or None,
+        )
+    except CommentError as exc:
+        await sockets.send(connection, error_message("invalid_message", str(exc)))
+        return
+
+    await sockets.broadcast(connection.project_id, {
+        "type": "comment_created", "comment": comment,
+        "counts": comments.counts(connection.project_id),
+    })
+    await push_activity(connection.project_id, limit=5)
+
+
+async def handle_comment_status(connection: Connection, message: dict) -> None:
+    try:
+        comment = comments.set_status(
+            connection.project_id, str(message.get("comment_id", ""))[:32],
+            str(message.get("status", "resolved")),
+            connection.client_id, connection.user_name)
+    except CommentError as exc:
+        await sockets.send(connection, error_message("invalid_message", str(exc)))
+        return
+
+    await sockets.broadcast(connection.project_id, {
+        "type": "comment_updated", "comment": comment,
+        "counts": comments.counts(connection.project_id),
+    })
+    await push_activity(connection.project_id, limit=5)
+
+
+async def handle_request_comments(connection: Connection, message: dict) -> None:
+    await sockets.send(connection, {
+        "type": "comments",
+        "threads": comments.threads(connection.project_id,
+                                    status=str(message.get("status", "all")),
+                                    viewer_id=connection.client_id),
+        "counts": comments.counts(connection.project_id),
+    })
+
+
+async def handle_request_activity(connection: Connection, message: dict) -> None:
+    await sockets.send(connection, {
+        "type": "activity",
+        "events": events.recent(connection.project_id,
+                                limit=int(message.get("limit", 50))),
+    })
+
+
+async def handle_request_whats_new(connection: Connection, message: dict) -> None:
+    await sockets.send(connection, {
+        "type": "whats_new",
+        "summary": events.since_last_read(connection.project_id, connection.client_id),
+    })
+
+
+async def handle_mark_read(connection: Connection, message: dict) -> None:
+    event_id = events.mark_read(connection.project_id, connection.client_id,
+                                message.get("event_id"))
+    await sockets.send(connection, {"type": "marked_read", "event_id": event_id})
+
+
+async def handle_request_summary(connection: Connection, message: dict) -> None:
+    """Locally generated hardware summary - no external service is contacted."""
+    summary = analyzer.summarise(PROJECT_DIR, force=bool(message.get("refresh")))
+    await sockets.send(connection, {"type": "summary", "summary": summary})
+
+
+async def push_activity(project_id: str, limit: int = 10) -> None:
+    await sockets.broadcast(project_id, {
+        "type": "activity", "events": events.recent(project_id, limit=limit)})
 
 
 async def handle_conflict_resolve(connection: Connection, message: dict) -> None:
@@ -436,6 +754,13 @@ async def handle_disconnect(connection: Connection, message: dict) -> None:
 
 HANDLERS = {
     "heartbeat": handle_heartbeat,
+    "comment_create": handle_comment_create,
+    "comment_status": handle_comment_status,
+    "request_comments": handle_request_comments,
+    "request_activity": handle_request_activity,
+    "request_whats_new": handle_request_whats_new,
+    "mark_read": handle_mark_read,
+    "request_summary": handle_request_summary,
     "presence": handle_presence,
     "request_state": handle_request_state,
     "request_history": handle_request_history,

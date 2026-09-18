@@ -1,9 +1,17 @@
 # KiCad Live — Test Plan
 
+This is the **PCB core's** matrix. The extension features have their own plans,
+each with observed results:
+
+* [SCHEMATIC_TEST_PLAN.md](SCHEMATIC_TEST_PLAN.md) — schematic collaboration
+* [COMMENTS_TEST_PLAN.md](COMMENTS_TEST_PLAN.md) — comments and threads
+* [DASHBOARD_TEST_PLAN.md](DASHBOARD_TEST_PLAN.md) — dashboard and REST API
+* [HARDWARE_SUMMARY_TEST_PLAN.md](HARDWARE_SUMMARY_TEST_PLAN.md) — offline summary
+
 ## How to run everything
 
 ```powershell
-# Unit + integration (no KiCad, no manual setup) - 99 tests, ~5 seconds
+# Unit + integration (no KiCad, no manual setup) - 200 tests, ~7 seconds
 python -m pytest tests\unit tests\integration -q
 
 # KiCad file API (needs KiCad installed, not running)
@@ -12,9 +20,10 @@ python -m pytest tests\unit tests\integration -q
 # Plugin install (needs KiCad installed)
 & "C:\Program Files\KiCad\10.0\bin\python.exe" tests\manual\test_plugin_loads.py
 
-# Live sync and locking (needs KiCad OPEN + server running)
+# Live sync, locking and schematic (needs KiCad OPEN + server running)
 python tests\manual\test_live_sync.py
 python tests\manual\test_live_locks.py
+python tests\manual\test_live_schematic.py
 
 # Environment readiness (per machine)
 python tools\check_env.py --server SERVER_IP

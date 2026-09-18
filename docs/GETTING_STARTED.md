@@ -38,11 +38,11 @@ instructions below are Windows-specific.
 Do this on **every** computer — server and clients alike.
 
 ```powershell
-git clone <YOUR_REPO_URL> kicad-live
-cd kicad-live
+git clone https://github.com/ar3misByte/KiEDA_live.git
+cd KiEDA_live
 ```
 
-If you do not have a Git remote, copy the whole `kicad-live` folder to each
+If you do not have a Git remote, copy the whole `KiEDA_live` folder to each
 machine with a USB stick or a network share. Either way, **every machine must
 end up with the same copy of `sample_project/demo_board.kicad_pcb`** — see
 step 9 for why that matters.
@@ -457,7 +457,9 @@ The full procedure with expected results for each test is in
 --name "Designer A"    required; your display name
 --port 8000            server port (default 8000)
 --project demo_board   project id (default: the open board's filename)
+--project-dir PATH     folder holding the .kicad_sch (default: current directory)
 --read-only            receive changes but never send any
+--no-schematic         do not watch the schematic at all
 --poll-interval 0.25   board poll period in seconds
 --verbose              debug logging
 ```
@@ -479,17 +481,131 @@ KiCad Live never saves your file; use Ctrl+S as usual when you are done.
 
 ---
 
-## 14. What KiCad Live does and does not do
+## 14. Schematic collaboration
+
+Schematic support works differently from the PCB, and the difference matters.
+
+**PCB is live. Schematic is review.**
+
+KiCad 10's schematic editor does not expose an IPC API — verified, see
+`docs/SCHEMATIC.md` — so nothing can be written into a running eeschema.
+KiCad Live therefore **watches the `.kicad_sch` file** and reports what changed
+when you save.
+
+What you get:
+
+* Everyone is told what you changed, seconds after you press Ctrl+S.
+* Changes appear in the activity timeline and the change inspector.
+* Symbols can be **locked** and **commented on**, like PCB footprints.
+* The hardware summary updates.
+
+What you do not get:
+
+* A symbol moving by itself on someone else's screen.
+* Detection of unsaved edits.
+
+**KiCad Live never writes your schematic.** It is opened read-only.
+
+The agent finds the schematic in `--project-dir` (default: the current
+directory). On startup it prints what it found:
+
+```text
+ Schematic  demo_board.kicad_sch (38 objects, 1 sheet(s)) - review only
+```
+
+### Try it
+
+1. On Computer 2, open `sample_project/demo_board.kicad_sch` in eeschema.
+2. Change R1's value and press **Ctrl+S**.
+3. Watch the dashboard's Activity page.
+
+**Expected:** `Designer A  changed R1 value from 4k7 to 10k` appears within
+about a second. Measured on the development machine: **0.80 s**.
+
+---
+
+## 15. The dashboard
+
+Open `http://SERVER_IP:8000/` on the machine driving the demo.
+
+| Page | What it is for |
+|---|---|
+| **Overview** | Designers online, changes today, locks, comments, conflicts |
+| **Schematic** | Symbols, sheets, schematic locks, comment badges |
+| **PCB** | Footprints, positions, PCB locks |
+| **Activity** | Full timeline, filterable; click a row for change details |
+| **Comments** | Review threads attached to real components |
+| **Hardware Summary** | What this board actually is, generated locally |
+
+To watch a different project: `http://SERVER_IP:8000/?project=my_board`
+
+Full guide for whoever is running the session:
+`docs/PROJECT_MANAGER_GUIDE.md`.
+
+---
+
+## 16. Comments
+
+Comments attach to real objects, not to a chat room.
+
+**From the dashboard:** Comments page, pick Schematic or PCB, type a reference
+(the field autocompletes from your actual project), write the note.
+
+**Quicker:** open the Schematic or PCB page and click the row you want to
+comment on.
+
+Replies are one level deep. Anyone can resolve or reopen a thread. The sidebar
+badge shows the open count, so unresolved review points stay visible.
+
+Comments live in `data/kicadlive.db` on the server and **never touch your KiCad
+files** — commenting cannot corrupt a design. They survive a server restart.
+
+---
+
+## 17. Hardware summary
+
+The **Hardware Summary** page describes the project: components, interfaces,
+power rails, board size, layer count.
+
+It is generated **entirely on the server, with no internet connection and no AI
+service**. Connectivity comes from KiCad's own `kicad-cli` netlist exporter;
+board facts from parsing the `.kicad_pcb`.
+
+The habit worth forming: **read the evidence line under each claim.**
+
+```text
+Interfaces      I2C
+                  evidence: net /SDA, net /SCL
+Microcontroller Not available
+                  evidence: no recognised MCU part number in the schematic
+```
+
+Anything the project does not evidence is reported as **Not available**, never
+guessed. A part being *capable* of USB is not evidence that the board uses USB.
+
+To analyse your own project instead of the sample, start the server with:
+
+```powershell
+$env:KICADLIVE_PROJECT_DIR = "D:\projects\my_board"
+python -m server.main
+```
+
+---
+
+## 18. What KiCad Live does and does not do
 
 **Does:**
-* Synchronises footprint position, rotation, layer, value and reference, live.
+* Synchronises footprint position, rotation, layer, value and reference, **live**.
+* Detects and reports schematic changes on save, with locks and comments.
 * Shows who is connected and what they have selected.
-* Soft-locks components as people select them.
+* Soft-locks components as people select them, in both domains.
 * Detects conflicting edits and refuses to guess between them.
-* Records a version history of every accepted change.
+* Records a persistent activity timeline, version history and comments.
+* Generates a hardware summary offline.
 
 **Does not:**
-* Synchronise tracks, vias, zones or schematics (see the stretch goals).
+* Apply schematic changes to anyone's eeschema — **impossible on KiCad 10**.
+* Synchronise tracks, vias or zones.
 * Save your board for you.
 * Enforce locks inside KiCad itself — locks are advisory and honoured by the
   agent.
@@ -497,7 +613,7 @@ KiCad Live never saves your file; use Ctrl+S as usual when you are done.
 
 ---
 
-## 15. If something goes wrong
+## 19. If something goes wrong
 
 `docs/TROUBLESHOOTING.md` covers every failure encountered while building this,
 each with SYMPTOM / CAUSE / CHECK / FIX / VERIFY.

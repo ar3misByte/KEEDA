@@ -32,7 +32,8 @@ def server(tmp_path_factory):
     """Start a real server subprocess on a free port."""
     port = free_port()
     data_dir = tmp_path_factory.mktemp("kicadlive_data")
-    env = dict(os.environ, KICADLIVE_DATA_DIR=str(data_dir), PYTHONPATH=ROOT)
+    env = dict(os.environ, KICADLIVE_DATA_DIR=str(data_dir), PYTHONPATH=ROOT,
+               PYTHONUNBUFFERED="1")
 
     # The server logs every lock, broadcast and connection. Piping that into an
     # undrained subprocess.PIPE fills the OS pipe buffer and blocks the server

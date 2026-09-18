@@ -18,6 +18,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agent.kicad_link import KiCadLink, KiCadUnavailable
+from agent.schematic_link import SchematicLink, SchematicUnavailable
 from agent.sync_agent import SyncAgent
 from agent.ws_client import WSClient
 from common.protocol import AGENT_VERSION, DEFAULT_PORT, POLL_INTERVAL
@@ -79,11 +80,31 @@ async def run(args) -> int:
     project_id = args.project or project_id_from_board(board_name)
     client_id = args.client_id or stable_client_id()
 
+    # Schematic collaboration is file-based and read-only (eeschema has no IPC
+    # API in KiCad 10). It needs the project directory; default to the working
+    # directory, which is the project folder in the documented workflow.
+    schematic = None
+    schematic_status = "disabled"
+    if not args.no_schematic:
+        project_dir = os.path.abspath(args.project_dir or os.getcwd())
+        try:
+            sch_link = SchematicLink(project_dir)
+            sheet_name = sch_link.connect()
+            schematic = sch_link
+            stats = sch_link.stats()
+            schematic_status = (f"{sheet_name} ({stats['objects']} objects, "
+                                f"{stats['sheets']} sheet(s)) - review only")
+        except SchematicUnavailable as exc:
+            schematic_status = f"not found ({exc})"
+        except Exception as exc:
+            schematic_status = f"unavailable ({exc})"
+
     print(f" KiCad      {link.version()}")
     print(f" Board      {board_name}")
     print(f" Project    {project_id}")
     print(f" User       {args.name}")
     print(f" Client id  {client_id}")
+    print(f" Schematic  {schematic_status}")
     print(f" Server     ws://{args.server}:{args.port}/ws")
     if args.read_only:
         print(" Mode       READ-ONLY (receives changes, sends none)")
@@ -92,7 +113,7 @@ async def run(args) -> int:
 
     ws = WSClient(args.server, args.port, client_id, args.name, project_id)
     agent = SyncAgent(link, ws, args.name, read_only=args.read_only,
-                      poll_interval=args.poll_interval)
+                      poll_interval=args.poll_interval, schematic=schematic)
 
     async def on_connect():
         # A fresh connection means our view may be stale; ask for the truth.
@@ -110,7 +131,8 @@ async def run(args) -> int:
         for task in tasks:
             task.cancel()
         await ws.stop()
-        print(f"\n Session totals: sent={agent.stats['sent']} "
+        print(f"\n Session totals: pcb-sent={agent.stats['sent']} "
+              f"schematic-sent={agent.stats['schematic_sent']} "
               f"received={agent.stats['received']} "
               f"conflicts={agent.stats['conflicts']} "
               f"blocked-by-lock={agent.stats['blocked']}")
@@ -127,6 +149,11 @@ def main() -> int:
     parser.add_argument("--client-id", default=None, help="override the stored client id")
     parser.add_argument("--read-only", action="store_true",
                         help="receive changes but never send any")
+    parser.add_argument("--project-dir", default=None,
+                        help="project folder holding the .kicad_sch "
+                             "(default: the current directory)")
+    parser.add_argument("--no-schematic", action="store_true",
+                        help="do not watch the schematic at all")
     parser.add_argument("--poll-interval", type=float, default=POLL_INTERVAL,
                         help=f"board poll period in seconds (default {POLL_INTERVAL})")
     parser.add_argument("--verbose", action="store_true")
