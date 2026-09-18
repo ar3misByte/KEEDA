@@ -28,6 +28,36 @@ class KiCadUnavailable(RuntimeError):
     """KiCad is not running, the API is disabled, or no board is open."""
 
 
+class KiCadBusy(KiCadUnavailable):
+    """KiCad is running but cannot answer right now.
+
+    KiCad replies "busy" while a modal dialog is open, while the user is in the
+    middle of an interactive tool (dragging a part), or while it is loading a
+    board. That is TRANSIENT: nothing is wrong and nothing should be torn down.
+    Callers must wait and retry rather than treat it as a lost connection.
+    Subclasses KiCadUnavailable so old `except KiCadUnavailable` still works.
+    """
+
+
+def _is_busy(exc: Exception) -> bool:
+    """True for errors that mean 'try again shortly', not 'KiCad is gone'."""
+    code = getattr(exc, "code", None)
+    try:
+        from kipy.proto.common import ApiStatusCode
+        busy_codes = {ApiStatusCode.AS_BUSY, ApiStatusCode.AS_TIMEOUT,
+                      ApiStatusCode.AS_NOT_READY}
+    except Exception:
+        busy_codes = {7, 2, 4}
+    text = str(exc).lower()
+    return (code in busy_codes or "busy" in text
+            or "timed out" in text or "timeout" in text)
+
+
+def _translate(exc: Exception, what: str) -> KiCadUnavailable:
+    cls = KiCadBusy if _is_busy(exc) else KiCadUnavailable
+    return cls(f"{what}: {exc}")
+
+
 class KiCadLink:
     def __init__(self, client_name_prefix: str = "kicad-live"):
         # A per-run suffix guarantees a crashed previous run can never block us
@@ -58,6 +88,8 @@ class KiCadLink:
             self._board = self._kicad.get_board()
         except Exception as exc:
             self._kicad = self._board = None
+            if _is_busy(exc):
+                raise KiCadBusy(f"KiCad is busy ({exc})") from exc
             raise KiCadUnavailable(
                 f"could not reach KiCad ({exc}). Is KiCad running with a PCB open, "
                 f"and is 'Enable KiCad API' ticked in Preferences > Plugins?"
@@ -109,7 +141,7 @@ class KiCadLink:
         try:
             footprints = self._board.get_footprints()
         except Exception as exc:
-            raise KiCadUnavailable(f"lost the connection to KiCad: {exc}") from exc
+            raise _translate(exc, "could not read the board") from exc
 
         snapshot: dict[str, dict] = {}
         for footprint in footprints:
@@ -137,8 +169,8 @@ class KiCadLink:
             return []
         try:
             selection = self._board.get_selection()
-        except Exception:
-            return []
+        except Exception as exc:
+            raise _translate(exc, "could not read the selection") from exc
         references: list[str] = []
         for item in selection:
             try:
@@ -153,10 +185,12 @@ class KiCadLink:
         """{uuid: reference} for the current selection."""
         if self._board is None:
             return {}
+        # Must raise on failure. Returning {} would read as "the user deselected
+        # everything" and make the agent release every lock they hold.
         try:
             selection = self._board.get_selection()
-        except Exception:
-            return {}
+        except Exception as exc:
+            raise _translate(exc, "could not read the selection") from exc
         result: dict[str, str] = {}
         for item in selection:
             try:
@@ -190,7 +224,7 @@ class KiCadLink:
         try:
             footprints = {f.id.value: f for f in self._board.get_footprints()}
         except Exception as exc:
-            raise KiCadUnavailable(f"lost the connection to KiCad: {exc}") from exc
+            raise _translate(exc, "could not read the board") from exc
 
         targets = []
         for uuid, object_changes in wanted.items():
@@ -215,7 +249,7 @@ class KiCadLink:
             self._board.push_commit(commit, description)
             pushed = True
         except Exception as exc:
-            raise KiCadUnavailable(f"failed to apply a change to KiCad: {exc}") from exc
+            raise _translate(exc, "failed to apply a change to KiCad") from exc
         finally:
             if not pushed:
                 # Never leave a commit open: it would poison this client name

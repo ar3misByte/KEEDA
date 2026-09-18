@@ -12,7 +12,7 @@ import uuid as uuidlib
 
 from common.diff_engine import apply_change, diff_snapshots, summarise
 from common.protocol import POLL_INTERVAL, SYNCED_FIELDS
-from agent.kicad_link import KiCadLink, KiCadUnavailable
+from agent.kicad_link import KiCadBusy, KiCadLink, KiCadUnavailable
 from agent.schematic_link import SchematicLink, SchematicUnavailable
 from agent.ws_client import WSClient
 
@@ -55,6 +55,13 @@ class SyncAgent:
                       "schematic_sent": 0}
         self._tick = 0
 
+        # Server state received but not yet adopted (KiCad was busy). The poll
+        # loop keeps retrying it; giving up would leave this machine never
+        # syncing at all.
+        self._pending_state: dict | None = None
+        # Remote changes KiCad could not accept yet, kept IN ORDER.
+        self._deferred: list[tuple[list[dict], str]] = []
+
     # ------------------------------------------------------------------ utils
 
     def _next_change_id(self) -> str:
@@ -94,32 +101,70 @@ class SyncAgent:
             except Exception:
                 log.exception("failed to handle %s", message.get("type"))
 
+    def on_reconnect(self) -> None:
+        """A fresh server connection brings a fresh project_state; drop stale work."""
+        self.state_ready.clear()
+        self._pending_state = None
+        self._deferred.clear()
+
+    async def _step(self) -> None:
+        """One unit of work. Raises KiCadBusy / KiCadUnavailable on KiCad trouble."""
+        if self._pending_state is not None:
+            await self._sync_state(self._pending_state)
+        elif self.state_ready.is_set():
+            await self._flush_deferred()
+            await self.poll_once()
+
     async def poll_loop(self) -> None:
-        await self.state_ready.wait()
+        delay = self.poll_interval
+        busy_streak = 0
         while True:
-            await asyncio.sleep(self.poll_interval)
+            await asyncio.sleep(delay)
             if not self.ws.connected.is_set():
                 continue
             try:
-                await self.poll_once()
+                await self._step()
+            except KiCadBusy:
+                # Transient: a dialog is open, or the user is mid-drag. Back off
+                # gently and try again. Nothing is torn down and nobody is told
+                # this user went offline.
+                busy_streak += 1
+                if busy_streak == 1:
+                    log.warning("KiCad is busy (open dialog or an operation in "
+                                "progress) - waiting; nothing is lost")
+                delay = min(self.poll_interval * (2 ** min(busy_streak, 4)), 3.0)
             except KiCadUnavailable as exc:
                 log.warning("KiCad unavailable: %s", exc)
-                await self.send_presence("offline", kicad_connected=False)
-                if not await self.try_reconnect_kicad():
-                    await asyncio.sleep(2.0)
+                await self._recover_kicad()
+                delay = self.poll_interval
             except Exception:
                 log.exception("poll failed")
                 await asyncio.sleep(1.0)
+                delay = self.poll_interval
+            else:
+                if busy_streak:
+                    log.info("KiCad is responding again")
+                busy_streak = 0
+                delay = self.poll_interval
 
-    async def try_reconnect_kicad(self) -> bool:
+    async def _recover_kicad(self) -> None:
+        """KiCad is genuinely gone (closed/restarted). Never let this raise:
+        an exception escaping the poll loop would kill the whole agent."""
         try:
+            await self.send_presence("offline", kicad_connected=False)
             self.link.connect()
+            self.baseline = self.link.read_snapshot()
         except KiCadUnavailable:
-            return False
+            await asyncio.sleep(2.0)
+            return
+        except Exception:
+            log.exception("could not recover the KiCad connection")
+            await asyncio.sleep(2.0)
+            return
         log.info("reconnected to KiCad")
-        self.baseline = self.link.read_snapshot()
+        self._deferred.clear()
         await self.request_state()
-        return True
+        await self.send_presence(self.last_activity)
 
     # ------------------------------------------------------------ local edits
 
@@ -321,18 +366,31 @@ class SyncAgent:
                  message.get("project_id"))
 
     async def _on_project_state(self, message: dict) -> None:
+        """Remember the server's state and try to adopt it now.
+
+        If KiCad is busy at this instant we must NOT give up. Returning here
+        without setting `state_ready` used to leave the poll loop waiting for
+        ever, so the machine never adopted existing work and never sent its
+        own edits. The message stays pending and the poll loop retries it.
+        """
+        self.locks = {lock["uuid"]: lock for lock in message.get("locks", [])}
+        self._pending_state = message
+        try:
+            await self._sync_state(message)
+        except KiCadUnavailable as exc:
+            log.warning("board not readable yet (%s); will keep retrying", exc)
+
+    async def _sync_state(self, message: dict) -> None:
         """Adopt the server's state wholesale. Also the reconnect path."""
         server_objects = message.get("objects") or {}
-        self.locks = {lock["uuid"]: lock for lock in message.get("locks", [])}
-
-        try:
-            current = self.link.read_snapshot()
-        except KiCadUnavailable as exc:
-            log.warning("cannot read the board while syncing state: %s", exc)
-            return
+        current = self.link.read_snapshot()     # KiCadBusy/Unavailable -> retried
+        # What the board REALLY holds. Without this, an empty baseline makes the
+        # next poll report every footprint as a brand-new local "add".
+        self.baseline = current
 
         if not server_objects:
             await self.seed(current)
+            self._pending_state = None
             self.state_ready.set()
             return
 
@@ -371,13 +429,13 @@ class SyncAgent:
         if unknown and not self.read_only:
             await self.seed({u: current[u] for u in unknown}, partial=True)
 
+        self._pending_state = None
         self.state_ready.set()
         await self.send_presence(self.last_activity)
 
     async def seed(self, objects: dict[str, dict], partial: bool = False) -> None:
         """Contribute objects the server does not know about yet."""
         if not objects or self.read_only:
-            self.baseline = self.link.read_snapshot()
             return
         changes = [{
             "operation": "add", "object_type": "footprint", "uuid": uuid,
@@ -387,7 +445,6 @@ class SyncAgent:
                  "extending" if partial else "seeding", len(changes))
         await self.ws.send({"type": "change", "client_id": self.ws.client_id,
                             "change_id": self._next_change_id(), "changes": changes})
-        self.baseline = self.link.read_snapshot()
 
     async def _on_remote_change(self, message: dict) -> None:
         changes = message.get("changes") or []
@@ -424,25 +481,68 @@ class SyncAgent:
     async def apply_remote(self, changes: list[dict], description: str) -> None:
         """Apply changes to KiCad without letting them bounce back out.
 
-        The baseline is updated to the expected post-state BEFORE the write, so
-        even if a poll interleaves with the write the diff comes out empty.
+        The board is written FIRST and the baseline updated only on success. The
+        old order (baseline first) meant a failed write left the baseline
+        claiming values the board never received, so the next poll "detected" a
+        local edit undoing the other person's change and sent it to the server.
+
+        If KiCad is busy the changes are queued, in order, and retried; a newer
+        change never jumps ahead of an older queued one.
         """
+        if self._deferred:
+            self._deferred.append((changes, description))
+            return
+        try:
+            self.link.apply_changes(changes, description)
+        except KiCadBusy:
+            self._deferred.append((changes, description))
+            log.warning("KiCad busy - %d change(s) queued, will apply when it responds",
+                        len(changes))
+            return
+        except KiCadUnavailable as exc:
+            log.warning("could not apply remote changes: %s", exc)
+            return
+        self._mark_applied(changes)
+
+    def _mark_applied(self, changes: list[dict]) -> None:
         for change in changes:
             uuid = change.get("uuid")
             if uuid:
                 self.echo_marks[uuid] = self._tick
                 apply_change(self.baseline, change)
-        try:
+
+    async def _flush_deferred(self) -> None:
+        """Retry queued changes oldest-first. KiCadBusy leaves them queued."""
+        while self._deferred:
+            changes, description = self._deferred[0]
             self.link.apply_changes(changes, description)
-        except KiCadUnavailable as exc:
-            log.warning("could not apply remote changes: %s", exc)
-            # We failed to write, so our baseline is now a lie. Re-read it.
-            for change in changes:
-                self.echo_marks.pop(change.get("uuid", ""), None)
-            try:
-                self.baseline = self.link.read_snapshot()
-            except KiCadUnavailable:
-                pass
+            self._deferred.pop(0)
+            self._mark_applied(changes)
+            log.info("applied %d queued remote change(s)", len(changes))
+
+    async def _on_whats_new(self, message: dict) -> None:
+        """Tell the user what others did while they were away.
+
+        PCB changes are applied automatically by the state sync. Schematic
+        changes CANNOT be applied to a running eeschema (it has no IPC API), so
+        they are listed here instead of silently missing.
+        """
+        summary = message.get("summary") or {}
+        if summary.get("is_first_visit") or not summary.get("total"):
+            return
+        counts = summary.get("counts") or {}
+        lines = ["Since you were last here: %d schematic change(s), %d PCB change(s), "
+                 "%d comment event(s)." % (counts.get("schematic", 0), counts.get("pcb", 0),
+                                           counts.get("comments", 0))]
+        for event in (summary.get("schematic") or [])[:8]:
+            lines.append("   schematic: %s %s" % (event.get("username"), event.get("description")))
+        if counts.get("schematic"):
+            lines.append("   Schematic edits are NOT applied to your editor: get the updated "
+                         ".kicad_sch from the author and reload it.")
+        if counts.get("pcb"):
+            lines.append("   PCB changes are applied to your board automatically.")
+        self.banner("\n  ".join(lines))
+        await self.ws.send({"type": "mark_read", "client_id": self.ws.client_id})
 
     async def _on_change_ack(self, message: dict) -> None:
         for entry in message.get("accepted", []):

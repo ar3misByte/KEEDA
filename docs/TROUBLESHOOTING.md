@@ -563,3 +563,42 @@ python tools\test_client.py --server SERVER_IP --name "Designer B"
 
 Then follow the backup script in `docs/DEMO.md`. It demonstrates every feature
 except live board updates — and it is honest about what is being shown.
+
+---
+
+## 21. "KiCad is busy and cannot respond to API requests now"
+
+**SYMPTOM**
+The agent prints `KiCad is busy ... waiting`, or this computer never picks up
+work that is already in the project, or its own edits never reach the others.
+
+**CAUSE**
+KiCad answers "busy" while a **dialog is open**, while you are **mid-drag or in
+an interactive tool**, or while it is **still loading the board**. It is
+temporary. Older versions treated it as a lost connection: the initial state
+sync gave up and never retried, the user showed as offline, and locks could be
+released.
+
+**CHECK**
+Look for `KiCad is busy` followed by `KiCad is responding again` in the agent
+window. If it never recovers, KiCad still has a dialog open.
+
+**FIX**
+1. Update to the current code (`git pull`), then restart the agent.
+2. Close any open dialog in KiCad (Preferences, Plot, Board Setup, a message
+   box). Modal dialogs block the API entirely.
+3. Start the agent only after the board has finished loading.
+
+The agent now waits for KiCad, queues incoming changes **in order**, and applies
+them when KiCad responds. Nobody is shown as offline while KiCad is merely busy.
+At startup it waits up to 60 s before giving up.
+
+**VERIFY**
+`KiCad is responding again` appears, then a change made on another computer
+shows up on this board.
+
+**Note on schematics**
+A schematic change made by someone else can never appear in your open eeschema
+(KiCad 10 has no API for it). When you connect, the agent prints what changed
+in the schematic while you were away; copy the updated `.kicad_sch` from the
+author and reload it.

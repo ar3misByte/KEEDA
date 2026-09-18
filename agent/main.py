@@ -17,7 +17,7 @@ import uuid as uuidlib
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent.kicad_link import KiCadLink, KiCadUnavailable
+from agent.kicad_link import KiCadBusy, KiCadLink, KiCadUnavailable
 from agent.schematic_link import SchematicLink, SchematicUnavailable
 from agent.sync_agent import SyncAgent
 from agent.ws_client import WSClient
@@ -66,7 +66,19 @@ async def run(args) -> int:
 
     link = KiCadLink()
     try:
-        board_name = link.connect()
+        # KiCad answers "busy" while it is still loading the board or while a
+        # dialog is open. That is not a failure: wait for it instead of quitting.
+        for attempt in range(30):
+            try:
+                board_name = link.connect()
+                break
+            except KiCadBusy:
+                if attempt == 0:
+                    print(" KiCad is busy - waiting for it (close any open dialog)...")
+                await asyncio.sleep(2.0)
+        else:
+            raise KiCadUnavailable("KiCad stayed busy for 60 s. Close any open dialog "
+                                   "in KiCad and start the agent again.")
     except KiCadUnavailable as exc:
         print("\n[FAIL] Could not connect to KiCad.")
         print(f"       {exc}\n")
@@ -117,7 +129,7 @@ async def run(args) -> int:
 
     async def on_connect():
         # A fresh connection means our view may be stale; ask for the truth.
-        agent.state_ready.clear()
+        agent.on_reconnect()
         await agent.send_presence("viewing")
 
     ws.on_connect = on_connect
