@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardware Summary - KiCad Live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="project">
+
+<div class="brand">
+  <span class="logo">&#9672;</span>
+  <div><h1>KiCad Live</h1><p>Project manager</p></div>
+</div>
+
+<div class="topbar">
+  <div class="project"><span>Project</span><b id="project-name">-</b></div>
+  <div class="right">
+    <span class="pill" id="online-count">0 online</span>
+    <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting...</span></span>
+  </div>
+</div>
+
+<nav></nav>
+
+<main>
+<h2 class="page-title">Hardware summary</h2>
+<p class="page-sub">Generated on this machine from the KiCad project. No internet connection and no AI service is used.</p>
+
+<div class="note">
+  Anything the project does not actually evidence is reported as <strong>Not available</strong>
+  rather than guessed. Each claim shows the evidence behind it.
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h3>At a glance <span class="count" id="gen-meta"></span></h3>
+  <div id="summary"><p class="empty">Loading...</p></div>
+</div>
+
+<div class="grid two">
+  <div class="card">
+    <h3>Interfaces detected</h3>
+    <ul class="list" id="interfaces"><li class="empty">Loading...</li></ul>
+  </div>
+  <div class="card">
+    <h3>Power nets</h3>
+    <ul class="list" id="power"><li class="empty">Loading...</li></ul>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Board</h3>
+  <div id="board"><p class="empty">Loading...</p></div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Component inventory</h3>
+  <table class="data">
+    <thead><tr><th>Category</th><th>Count</th><th>References</th></tr></thead>
+    <tbody id="inventory"></tbody>
+  </table>
+</div>
+
+<div class="card" id="warn-card" style="margin-top:16px;display:none">
+  <h3>Notes</h3>
+  <ul id="warnings" style="margin:0;padding-left:20px;color:var(--muted)"></ul>
+</div>
+
+</main>
+
+<div class="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overview - KiCad Live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="index">
+
+<div class="brand">
+  <span class="logo">&#9672;</span>
+  <div><h1>KiCad Live</h1><p>Project manager</p></div>
+</div>
+
+<div class="topbar">
+  <div class="project"><span>Project</span><b id="project-name">-</b></div>
+  <div class="right">
+    <span class="pill" id="online-count">0 online</span>
+    <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting...</span></span>
+  </div>
+</div>
+
+<nav></nav>
+
+<main>
+<h2 class="page-title">Overview</h2>
+<p class="page-sub">Live status of the project and everyone working on it.</p>
+
+<div class="grid stats">
+  <div class="card stat"><div class="value" id="stat-users">0</div><div class="label">Designers online</div></div>
+  <div class="card stat"><div class="value" id="stat-changes">0</div><div class="label">Changes today</div></div>
+  <div class="card stat"><div class="value" id="stat-locks">0</div><div class="label">Active locks</div></div>
+  <div class="card stat warn"><div class="value" id="stat-comments">0</div><div class="label">Open comments</div></div>
+  <div class="card stat alert"><div class="value" id="stat-conflicts">0</div><div class="label">Conflicts</div></div>
+  <div class="card stat"><div class="value" id="stat-version">0</div><div class="label">Version</div></div>
+</div>
+
+<div class="grid two" style="margin-top:16px">
+  <div class="card">
+    <h3>Active users</h3>
+    <ul class="list" id="users"><li class="empty">Loading...</li></ul>
+  </div>
+  <div class="card">
+    <h3>Component locks</h3>
+    <p class="note" style="margin:-4px 0 10px">Locks are <strong>advisory</strong> - honoured by the KiCad Live agent, not enforced by KiCad.</p>
+    <ul class="list" id="locks"><li class="empty">Loading...</li></ul>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Recent activity</h3>
+  <ul class="feed" id="recent"><li class="empty">Loading...</li></ul>
+</div>
+
+</main>
+
+<div class="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

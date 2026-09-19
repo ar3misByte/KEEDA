@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Activity - KiCad Live</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body data-page="activity">
+
+<div class="brand">
+  <span class="logo">&#9672;</span>
+  <div><h1>KiCad Live</h1><p>Project manager</p></div>
+</div>
+
+<div class="topbar">
+  <div class="project"><span>Project</span><b id="project-name">-</b></div>
+  <div class="right">
+    <span class="pill" id="online-count">0 online</span>
+    <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting...</span></span>
+  </div>
+</div>
+
+<nav></nav>
+
+<main>
+<h2 class="page-title">Activity timeline</h2>
+<p class="page-sub">Every recorded change, lock, conflict and comment. Click an entry for details.</p>
+
+<div class="filters">
+  <select id="f-user"><option value="">All users</option></select>
+  <select id="f-domain">
+    <option value="">All domains</option>
+    <option value="schematic">Schematic</option>
+    <option value="pcb">PCB</option>
+    <option value="collab">Collaboration</option>
+    <option value="project">Project</option>
+  </select>
+  <select id="f-action">
+    <option value="">All actions</option>
+    <option value="modified">Modified</option>
+    <option value="added">Added</option>
+    <option value="removed">Removed</option>
+    <option value="lock_acquired">Lock acquired</option>
+    <option value="lock_denied">Lock denied</option>
+    <option value="conflict_detected">Conflict</option>
+    <option value="comment_created">Comment</option>
+    <option value="connected">Connected</option>
+  </select>
+  <div class="spacer"></div>
+  <span class="pill" id="count">0 events</span>
+</div>
+
+<div class="card">
+  <ul class="feed" id="timeline"><li class="empty">Loading...</li></ul>
+</div>
+
+</main>
+
+<div class="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
